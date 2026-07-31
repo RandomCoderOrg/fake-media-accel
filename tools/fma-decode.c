@@ -54,6 +54,7 @@ static int read_file(const char *path, uint8_t **data, size_t *size) {
 }
 
 static size_t find_access_units(const uint8_t *data, size_t size,
+                                uint32_t codec,
                                 struct access_unit **units_out) {
     size_t capacity = 64;
     size_t count = 0;
@@ -69,7 +70,12 @@ static size_t find_access_units(const uint8_t *data, size_t size,
         else if (i + 5 < size && data[i] == 0 && data[i + 1] == 0 &&
                  data[i + 2] == 0 && data[i + 3] == 1)
             start_code = 4;
-        if (!start_code || (data[i + start_code] & 0x1f) != 9)
+        if (!start_code)
+            continue;
+        uint32_t nal_type = codec == FMA_CODEC_HEVC ?
+            (data[i + start_code] >> 1) & 0x3f : data[i + start_code] & 0x1f;
+        uint32_t aud_type = codec == FMA_CODEC_HEVC ? 35u : 9u;
+        if (nal_type != aud_type)
             continue;
         if (found_aud) {
             if (count == capacity) {
@@ -96,6 +102,14 @@ static size_t find_access_units(const uint8_t *data, size_t size,
     }
     *units_out = units;
     return count;
+}
+
+static uint32_t parse_codec(const char *name) {
+    if (strcmp(name, "h264") == 0 || strcmp(name, "avc") == 0)
+        return FMA_CODEC_H264;
+    if (strcmp(name, "hevc") == 0 || strcmp(name, "h265") == 0)
+        return FMA_CODEC_HEVC;
+    return 0;
 }
 
 static int process_message(struct fma_client *client,
@@ -137,25 +151,44 @@ static int process_message(struct fma_client *client,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6 || argc > 7) {
-        fprintf(stderr, "usage: %s SOCKET INPUT.h264 WIDTH HEIGHT FPS [OUTPUT.nv12]\n",
-                argv[0]);
+    uint32_t codec = FMA_CODEC_H264;
+    uint32_t repeats = 1;
+    int argument = 1;
+    while (argument < argc && strncmp(argv[argument], "--", 2) == 0) {
+        if (strcmp(argv[argument], "--codec") == 0 && argument + 1 < argc) {
+            codec = parse_codec(argv[argument + 1]);
+            argument += 2;
+        } else if (strcmp(argv[argument], "--repeat") == 0 && argument + 1 < argc) {
+            repeats = (uint32_t)strtoul(argv[argument + 1], NULL, 10);
+            argument += 2;
+        } else {
+            codec = 0;
+            break;
+        }
+    }
+    int remaining = argc - argument;
+    if (!codec || !repeats || repeats > 1000 || remaining < 5 || remaining > 6) {
+        fprintf(stderr, "usage: %s [--codec h264|hevc] [--repeat N] "
+                "SOCKET INPUT WIDTH HEIGHT FPS [OUTPUT.nv12]\n", argv[0]);
         return 2;
     }
-    uint32_t width = (uint32_t)strtoul(argv[3], NULL, 10);
-    uint32_t height = (uint32_t)strtoul(argv[4], NULL, 10);
-    uint32_t fps = (uint32_t)strtoul(argv[5], NULL, 10);
+    const char *socket_path = argv[argument + 0];
+    const char *input_path = argv[argument + 1];
+    uint32_t width = (uint32_t)strtoul(argv[argument + 2], NULL, 10);
+    uint32_t height = (uint32_t)strtoul(argv[argument + 3], NULL, 10);
+    uint32_t fps = (uint32_t)strtoul(argv[argument + 4], NULL, 10);
+    const char *output_path = remaining == 6 ? argv[argument + 5] : NULL;
     if (!width || !height || !fps)
         return 2;
 
     uint8_t *input = NULL;
     size_t input_size = 0;
-    if (read_file(argv[2], &input, &input_size) < 0) {
+    if (read_file(input_path, &input, &input_size) < 0) {
         perror("input");
         return 1;
     }
     struct access_unit *units = NULL;
-    size_t unit_count = find_access_units(input, input_size, &units);
+    size_t unit_count = find_access_units(input, input_size, codec, &units);
     if (!unit_count) {
         fprintf(stderr, "could not split input\n");
         free(input);
@@ -163,14 +196,14 @@ int main(int argc, char **argv) {
     }
 
     struct fma_client client;
-    if (fma_client_connect(&client, argv[1]) < 0) {
+    if (fma_client_connect(&client, socket_path) < 0) {
         perror("connect");
         free(units);
         free(input);
         return 1;
     }
     struct fma_decoder_config config = {
-        .codec = FMA_CODEC_H264, .width = width, .height = height,
+        .codec = codec, .width = width, .height = height,
         .slot_count = FMA_DEFAULT_SLOTS,
     };
     struct fma_frame_pool pool;
@@ -192,8 +225,8 @@ int main(int argc, char **argv) {
         free(input);
         return 1;
     }
-    FILE *output = argc == 7 ? fopen(argv[6], "wb") : NULL;
-    if (argc == 7 && !output) {
+    FILE *output = output_path ? fopen(output_path, "wb") : NULL;
+    if (output_path && !output) {
         perror("output");
         return 1;
     }
@@ -204,35 +237,46 @@ int main(int argc, char **argv) {
     uint64_t started_ns = monotonic_ns();
     bool eos = false;
     bool failed = false;
-    for (size_t i = 0; i < unit_count; ++i) {
-        int64_t pts_us = (int64_t)(i * UINT64_C(1000000) / fps);
-        bool packet_ack = false;
-        if (fma_client_queue_packet(&client, input + units[i].offset,
-                                    units[i].size, pts_us, 0) < 0) {
-            perror("decode");
-            failed = true;
-            break;
+    for (uint32_t repeat = 0; repeat < repeats && !failed; ++repeat) {
+        eos = false;
+        for (size_t i = 0; i < unit_count; ++i) {
+            int64_t pts_us = (int64_t)(i * UINT64_C(1000000) / fps);
+            bool packet_ack = false;
+            if (fma_client_queue_packet(&client, input + units[i].offset,
+                                        units[i].size, pts_us, 0) < 0) {
+                perror("decode");
+                failed = true;
+                break;
+            }
+            input_bytes += units[i].size;
+            while (!packet_ack &&
+                   process_message(&client, &pool, pool_map, output, &frames,
+                                   &packet_ack, &eos) == 0) {}
+            if (!packet_ack) {
+                perror("decode");
+                failed = true;
+                break;
+            }
         }
-        input_bytes += units[i].size;
-        while (!packet_ack &&
-               process_message(&client, &pool, pool_map, output, &frames,
-                               &packet_ack, &eos) == 0) {}
-        if (!packet_ack) {
-            perror("decode");
-            failed = true;
-            break;
+        if (!failed && fma_client_drain(&client) == 0) {
+            bool packet_ack = false;
+            while (!eos && process_message(&client, &pool, pool_map, output,
+                                           &frames, &packet_ack, &eos) == 0) {}
         }
-    }
-    if (!failed && fma_client_drain(&client) == 0) {
-        bool packet_ack = false;
-        while (!eos && process_message(&client, &pool, pool_map, output,
-                                       &frames, &packet_ack, &eos) == 0) {}
+        if (!eos)
+            failed = true;
+        if (!failed && repeat + 1 < repeats && fma_client_flush(&client) < 0) {
+            perror("flush");
+            failed = true;
+        }
     }
     uint64_t elapsed_ns = monotonic_ns() - started_ns;
     frame_bytes = frames * pool.slot_size;
     double seconds = elapsed_ns ? (double)elapsed_ns / 1000000000.0 : 0.0;
-    printf("packets=%zu frames=%llu elapsed_ms=%.3f decode_fps=%.2f\n",
-           unit_count, (unsigned long long)frames, seconds * 1000.0,
+    printf("codec=%s repeats=%u packets=%zu frames=%llu elapsed_ms=%.3f "
+           "decode_fps=%.2f\n",
+           fma_codec_name(codec), repeats, unit_count * (size_t)repeats,
+           (unsigned long long)frames, seconds * 1000.0,
            seconds > 0.0 ? (double)frames / seconds : 0.0);
     printf("compressed_bytes=%llu frame_bytes=%llu shared_pool_bytes=%zu "
            "socket_frame_bytes=0\n",

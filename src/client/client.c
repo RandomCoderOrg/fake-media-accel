@@ -132,7 +132,14 @@ int fma_client_drain(struct fma_client *client) {
 }
 
 int fma_client_flush(struct fma_client *client) {
-    return send_simple(client, FMA_MSG_FLUSH, NULL, 0, 0, 0, NULL);
+    uint64_t request_id;
+    if (send_simple(client, FMA_MSG_FLUSH, NULL, 0, 0, 0, &request_id) < 0)
+        return -1;
+    struct fma_message reply;
+    if (expect(client, FMA_MSG_FLUSHED, request_id, &reply) < 0)
+        return -1;
+    fma_message_release(&reply);
+    return 0;
 }
 
 int fma_client_release_frame(struct fma_client *client, uint32_t slot) {

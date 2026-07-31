@@ -18,7 +18,12 @@ while [ ! -S "$socket" ]; do
     sleep 0.01
 done
 
-"$decoder" "$socket" "$input" 64 64 30 "$output"
+result=$("$decoder" --repeat 3 "$socket" "$input" 64 64 30 "$output")
+printf '%s\n' "$result"
+case "$result" in
+    *"repeats=3 packets=3 frames=3 "*) ;;
+    *) exit 1 ;;
+esac
 wait "$daemon_pid"
 trap - EXIT INT TERM
 test -s "$output"

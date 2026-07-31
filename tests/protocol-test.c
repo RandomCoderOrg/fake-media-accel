@@ -46,6 +46,20 @@ static void test_rejects_bad_wire(void) {
     CHECK(errno == EPROTO);
 }
 
+static void test_rejects_unbounded_decoder(void) {
+    struct fma_decoder_config config = {
+        .codec = FMA_CODEC_H264,
+        .width = FMA_MAX_DIMENSION + 1,
+        .height = 1080,
+        .slot_count = FMA_DEFAULT_SLOTS,
+    };
+    uint8_t wire[16];
+    fma_encode_decoder_config(&config, wire);
+    struct fma_decoder_config decoded;
+    CHECK(fma_decode_decoder_config(wire, sizeof(wire), &decoded) == -1);
+    CHECK(errno == EINVAL);
+}
+
 static void test_payload_and_fd_roundtrip(void) {
     int sockets[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -74,6 +88,7 @@ static void test_payload_and_fd_roundtrip(void) {
 int main(void) {
     test_header_roundtrip();
     test_rejects_bad_wire();
+    test_rejects_unbounded_decoder();
     test_payload_and_fd_roundtrip();
     puts("protocol tests passed");
     return 0;

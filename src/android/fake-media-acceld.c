@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef bool (*binder_set_max_threads_fn)(uint32_t);
@@ -33,12 +34,25 @@ struct decoder_session {
     int pool_fd;
     uint8_t *pool_map;
     size_t pool_bytes;
-    bool slots[16];
+    bool slots[FMA_MAX_SLOTS];
     uint32_t next_slot;
     bool started;
+    uint32_t codec_id;
+    uint64_t packets;
+    uint64_t input_bytes;
+    uint64_t frames;
+    uint64_t frame_bytes;
+    uint64_t acquire_ns;
+    uint64_t copy_ns;
 };
 
 static volatile sig_atomic_t running = 1;
+
+static uint64_t monotonic_ns(void) {
+    struct timespec time;
+    return clock_gettime(CLOCK_MONOTONIC, &time) == 0 ?
+        (uint64_t)time.tv_sec * UINT64_C(1000000000) + (uint64_t)time.tv_nsec : 0;
+}
 
 static void on_signal(int signal_number) {
     (void)signal_number;
@@ -86,6 +100,19 @@ static int send_error(int fd, const struct fma_message *request, const char *tex
 }
 
 static void destroy_decoder(struct decoder_session *session) {
+    if (session->packets) {
+        printf("metrics codec=%s packets=%llu input_bytes=%llu frames=%llu "
+               "frame_bytes=%llu acquire_ms=%.3f copy_ms=%.3f "
+               "socket_frame_bytes=0\n",
+               fma_codec_name(session->codec_id),
+               (unsigned long long)session->packets,
+               (unsigned long long)session->input_bytes,
+               (unsigned long long)session->frames,
+               (unsigned long long)session->frame_bytes,
+               (double)session->acquire_ns / 1000000.0,
+               (double)session->copy_ns / 1000000.0);
+        fflush(stdout);
+    }
     if (session->codec && session->started)
         AMediaCodec_stop(session->codec);
     if (session->codec)
@@ -122,6 +149,7 @@ static int create_decoder(struct decoder_session *session,
     const char *mime = fma_codec_mime(config->codec);
     if (!mime)
         return -1;
+    session->codec_id = config->codec;
 
     uint32_t stride = (config->width + 63u) & ~63u;
     session->pool = (struct fma_frame_pool) {
@@ -317,9 +345,16 @@ static int emit_output(int fd, const struct fma_message *request,
             AImage *image = NULL;
             uint32_t slot = UINT32_MAX;
             struct fma_frame frame;
-            if (find_free_slot(session, &slot) < 0 ||
-                acquire_image(session->reader, &image) < 0 ||
-                copy_image_to_nv12(image, session, slot, &frame) < 0) {
+            uint64_t started_ns = monotonic_ns();
+            int slot_status = find_free_slot(session, &slot);
+            int acquire_status = slot_status == 0 ?
+                acquire_image(session->reader, &image) : -1;
+            session->acquire_ns += monotonic_ns() - started_ns;
+            started_ns = monotonic_ns();
+            int copy_status = acquire_status == 0 ?
+                copy_image_to_nv12(image, session, slot, &frame) : -1;
+            session->copy_ns += monotonic_ns() - started_ns;
+            if (slot_status < 0 || acquire_status < 0 || copy_status < 0) {
                 if (image)
                     AImage_delete(image);
                 if (slot < session->pool.slot_count)
@@ -327,6 +362,8 @@ static int emit_output(int fd, const struct fma_message *request,
                 return -1;
             }
             AImage_delete(image);
+            session->frames++;
+            session->frame_bytes += frame.bytes_used;
             uint8_t payload[24];
             fma_encode_frame(&frame, payload);
             struct fma_message frame_request = *request;
@@ -438,6 +475,8 @@ static int serve_client(int fd) {
         case FMA_MSG_QUEUE_PACKET: {
             uint32_t flags = (request.flags & FMA_PACKET_CODEC_CONFIG) ?
                 AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG : 0;
+            session.packets++;
+            session.input_bytes += request.payload_size;
             if (!session.started || queue_input(&session, &request, flags) < 0 ||
                 emit_output(fd, &request, &session, 0, false) < 0)
                 result = send_error(fd, &request, "MediaCodec packet failed");
