@@ -444,7 +444,8 @@ static int serve_client(int fd) {
             struct fma_capabilities caps = {
                 .decoder_mask = probe_decoders(),
                 .pixel_format_mask = 1u << (FMA_PIXFMT_NV12 - 1u),
-                .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH,
+                .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH |
+                         FMA_CAP_CAN_POLL,
                 .max_width = 0,
                 .max_height = 0,
             };
@@ -520,6 +521,23 @@ static int serve_client(int fd) {
                 }
             }
             break;
+        case FMA_MSG_POLL_OUTPUT: {
+            if (!session.started || request.payload_size != 4) {
+                result = send_error(fd, &request, "invalid output poll");
+                break;
+            }
+            uint32_t timeout_ms = fma_get_u32(request.payload);
+            if (timeout_ms > 1000)
+                timeout_ms = 1000;
+            int output = emit_output(fd, &request, &session,
+                                     (int64_t)timeout_ms * 1000, false);
+            if (output < 0)
+                result = send_error(fd, &request, "MediaCodec output poll failed");
+            else
+                result = send_reply(fd, &request, FMA_MSG_POLL_DONE, NULL, 0,
+                                    session.id, -1);
+            break;
+        }
         case FMA_MSG_CLOSE:
             fma_message_release(&request);
             destroy_decoder(&session);

@@ -25,6 +25,7 @@ int fma_client_queue_packet(struct fma_client *client, const void *data,
                             size_t size, int64_t pts_us, uint32_t flags);
 int fma_client_drain(struct fma_client *client);
 int fma_client_flush(struct fma_client *client);
+int fma_client_poll_output(struct fma_client *client, uint32_t timeout_ms);
 int fma_client_release_frame(struct fma_client *client, uint32_t slot);
 int fma_client_receive(struct fma_client *client, struct fma_message *message);
 

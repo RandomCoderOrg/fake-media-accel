@@ -142,6 +142,13 @@ int fma_client_flush(struct fma_client *client) {
     return 0;
 }
 
+int fma_client_poll_output(struct fma_client *client, uint32_t timeout_ms) {
+    uint8_t payload[4];
+    fma_put_u32(payload, timeout_ms);
+    return send_simple(client, FMA_MSG_POLL_OUTPUT, payload, sizeof(payload),
+                       0, 0, NULL);
+}
+
 int fma_client_release_frame(struct fma_client *client, uint32_t slot) {
     uint8_t payload[4];
     fma_put_u32(payload, slot);

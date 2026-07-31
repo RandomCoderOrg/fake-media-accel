@@ -21,7 +21,7 @@ struct fake_session {
     uint8_t *pool_map;
     size_t pool_bytes;
     uint32_t next_slot;
-    bool slots[16];
+    bool slots[FMA_MAX_SLOTS];
 };
 
 static volatile sig_atomic_t running = 1;
@@ -177,7 +177,8 @@ static int handle_client(int fd) {
                                 FMA_CODEC_BIT(FMA_CODEC_VP9) |
                                 FMA_CODEC_BIT(FMA_CODEC_AV1),
                 .pixel_format_mask = 1u << (FMA_PIXFMT_NV12 - 1u),
-                .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH,
+                .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH |
+                         FMA_CAP_CAN_POLL,
                 .max_width = 8192,
                 .max_height = 8192,
             };
@@ -227,6 +228,13 @@ static int handle_client(int fd) {
         case FMA_MSG_DRAIN:
             result = send_reply(fd, &request, FMA_MSG_OUTPUT_EOS, NULL, 0,
                                 session.id, -1);
+            break;
+        case FMA_MSG_POLL_OUTPUT:
+            if (request.payload_size != 4)
+                result = send_error(fd, &request, "invalid poll request");
+            else
+                result = send_reply(fd, &request, FMA_MSG_POLL_DONE, NULL, 0,
+                                    session.id, -1);
             break;
         case FMA_MSG_CLOSE:
             fma_message_release(&request);

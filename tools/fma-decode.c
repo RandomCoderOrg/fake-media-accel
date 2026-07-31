@@ -115,7 +115,7 @@ static uint32_t parse_codec(const char *name) {
 static int process_message(struct fma_client *client,
                            const struct fma_frame_pool *pool, uint8_t *pool_map,
                            FILE *output, uint64_t *frames, bool *packet_ack,
-                           bool *eos) {
+                           bool *eos, bool *poll_done) {
     struct fma_message message;
     if (fma_client_receive(client, &message) < 0)
         return -1;
@@ -140,6 +140,8 @@ static int process_message(struct fma_client *client,
         *packet_ack = true;
     } else if (message.type == FMA_MSG_OUTPUT_EOS) {
         *eos = true;
+    } else if (message.type == FMA_MSG_POLL_DONE) {
+        *poll_done = true;
     } else if (message.type == FMA_MSG_ERROR) {
         fprintf(stderr, "daemon: %.*s\n", (int)message.payload_size,
                 message.payload ? (char *)message.payload : "error");
@@ -242,6 +244,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < unit_count; ++i) {
             int64_t pts_us = (int64_t)(i * UINT64_C(1000000) / fps);
             bool packet_ack = false;
+            bool poll_done = false;
             if (fma_client_queue_packet(&client, input + units[i].offset,
                                         units[i].size, pts_us, 0) < 0) {
                 perror("decode");
@@ -251,17 +254,28 @@ int main(int argc, char **argv) {
             input_bytes += units[i].size;
             while (!packet_ack &&
                    process_message(&client, &pool, pool_map, output, &frames,
-                                   &packet_ack, &eos) == 0) {}
+                                   &packet_ack, &eos, &poll_done) == 0) {}
             if (!packet_ack) {
                 perror("decode");
                 failed = true;
                 break;
             }
         }
+        if (!failed && fma_client_poll_output(&client, 0) == 0) {
+            bool packet_ack = false;
+            bool poll_done = false;
+            while (!poll_done &&
+                   process_message(&client, &pool, pool_map, output, &frames,
+                                   &packet_ack, &eos, &poll_done) == 0) {}
+            if (!poll_done)
+                failed = true;
+        }
         if (!failed && fma_client_drain(&client) == 0) {
             bool packet_ack = false;
+            bool poll_done = false;
             while (!eos && process_message(&client, &pool, pool_map, output,
-                                           &frames, &packet_ack, &eos) == 0) {}
+                                           &frames, &packet_ack, &eos,
+                                           &poll_done) == 0) {}
         }
         if (!eos)
             failed = true;
