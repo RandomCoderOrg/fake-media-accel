@@ -1,0 +1,7 @@
+/build/
+/build-android-*/
+*.raw
+*.h264
+*.hevc
+*.log
+.DS_Store
