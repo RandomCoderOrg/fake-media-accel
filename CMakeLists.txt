@@ -29,6 +29,30 @@ else()
     add_executable(fake-media-acceld src/fake/fake-media-acceld.c)
     target_link_libraries(fake-media-acceld PRIVATE fma-common)
 
+    include(GNUInstallDirs)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBVA QUIET IMPORTED_TARGET libva)
+    endif()
+    if(LIBVA_FOUND)
+        add_library(fma-va-driver SHARED
+            src/va/fma_drv_video.c
+            src/va/h264_annexb.c
+        )
+        target_include_directories(fma-va-driver PRIVATE include src/va)
+        target_link_libraries(fma-va-driver PRIVATE fma-client PkgConfig::LIBVA)
+        set_target_properties(fma-va-driver PROPERTIES
+            OUTPUT_NAME fma_drv_video
+            PREFIX ""
+        )
+        install(TARGETS fma-va-driver
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/dri)
+        add_executable(fma-va-driver-test tests/va-driver-test.c)
+        target_link_libraries(fma-va-driver-test PRIVATE
+            fma-va-driver PkgConfig::LIBVA
+        )
+    endif()
+
     include(CTest)
     if(BUILD_TESTING)
         add_executable(fma-protocol-test tests/protocol-test.c)
@@ -41,5 +65,12 @@ else()
                 ${CMAKE_BINARY_DIR}/fake-roundtrip.sock
                 ${CMAKE_SOURCE_DIR}/LICENSE
                 ${CMAKE_BINARY_DIR}/fake-roundtrip.nv12)
+        if(LIBVA_FOUND)
+            add_test(NAME va-roundtrip
+                COMMAND sh ${CMAKE_SOURCE_DIR}/tests/va-roundtrip.sh
+                    $<TARGET_FILE:fake-media-acceld>
+                    $<TARGET_FILE:fma-va-driver-test>
+                    ${CMAKE_BINARY_DIR}/va-roundtrip.sock)
+        endif()
     endif()
 endif()

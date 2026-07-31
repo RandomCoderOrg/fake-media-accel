@@ -1,4 +1,5 @@
 /build/
+/build-va/
 /build-android-*/
 *.raw
 *.h264
