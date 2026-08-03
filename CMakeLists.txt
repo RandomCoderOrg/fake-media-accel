@@ -33,15 +33,22 @@ else()
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(LIBVA QUIET IMPORTED_TARGET libva)
+        pkg_check_modules(LIBVA_X11 QUIET IMPORTED_TARGET libva-x11)
+        pkg_check_modules(EGL QUIET IMPORTED_TARGET egl)
+        pkg_check_modules(GLESV2 QUIET IMPORTED_TARGET glesv2)
+        pkg_check_modules(OPENGL QUIET IMPORTED_TARGET gl)
+        pkg_check_modules(X11 QUIET IMPORTED_TARGET x11)
     endif()
     if(LIBVA_FOUND)
+        find_package(Threads REQUIRED)
         add_library(fma-va-driver SHARED
             src/va/fma_drv_video.c
             src/va/h264_annexb.c
             src/va/h264_timing.c
         )
         target_include_directories(fma-va-driver PRIVATE include src/va)
-        target_link_libraries(fma-va-driver PRIVATE fma-client PkgConfig::LIBVA)
+        target_link_libraries(fma-va-driver PRIVATE
+            fma-client PkgConfig::LIBVA Threads::Threads)
         set_target_properties(fma-va-driver PROPERTIES
             OUTPUT_NAME fma_drv_video
             PREFIX ""
@@ -53,6 +60,24 @@ else()
             fma-va-driver PkgConfig::LIBVA
         )
         target_include_directories(fma-va-driver-test PRIVATE src/va)
+        add_executable(fma-va-surface-contract-test
+            tests/va-surface-contract-test.c)
+        target_link_libraries(fma-va-surface-contract-test PRIVATE
+            fma-va-driver PkgConfig::LIBVA
+        )
+        if(LIBVA_X11_FOUND AND EGL_FOUND AND GLESV2_FOUND AND X11_FOUND)
+            add_executable(fma-va-egl-probe tools/fma-va-egl-probe.c)
+            target_link_libraries(fma-va-egl-probe PRIVATE
+                PkgConfig::LIBVA PkgConfig::LIBVA_X11 PkgConfig::EGL
+                PkgConfig::GLESV2 PkgConfig::X11
+            )
+        endif()
+        if(EGL_FOUND AND OPENGL_FOUND)
+            add_library(fma-egl-trace SHARED tools/fma-egl-trace.c)
+            target_link_libraries(fma-egl-trace PRIVATE
+                PkgConfig::EGL PkgConfig::OPENGL ${CMAKE_DL_LIBS}
+            )
+        endif()
         add_executable(fma-h264-timing-test
             tests/h264-timing-test.c
             src/va/h264_timing.c
@@ -74,11 +99,28 @@ else()
                 ${CMAKE_BINARY_DIR}/fake-roundtrip.nv12)
         if(LIBVA_FOUND)
             add_test(NAME h264-timing COMMAND fma-h264-timing-test)
+            add_test(NAME va-surface-contract
+                COMMAND fma-va-surface-contract-test)
+            add_test(NAME va-surface-contract-cpu
+                COMMAND ${CMAKE_COMMAND} -E env FMA_VA_DMA_HEAP=none
+                    $<TARGET_FILE:fma-va-surface-contract-test>)
             add_test(NAME va-roundtrip
                 COMMAND sh ${CMAKE_SOURCE_DIR}/tests/va-roundtrip.sh
                     $<TARGET_FILE:fake-media-acceld>
                     $<TARGET_FILE:fma-va-driver-test>
                     ${CMAKE_BINARY_DIR}/va-roundtrip.sock)
+            add_test(NAME va-roundtrip-fallback
+                COMMAND ${CMAKE_COMMAND} -E env FMA_FAKE_DIRECT_OUTPUT=0
+                    sh ${CMAKE_SOURCE_DIR}/tests/va-roundtrip.sh
+                    $<TARGET_FILE:fake-media-acceld>
+                    $<TARGET_FILE:fma-va-driver-test>
+                    ${CMAKE_BINARY_DIR}/va-roundtrip-fallback.sock)
+            add_test(NAME va-roundtrip-cpu-surface
+                COMMAND ${CMAKE_COMMAND} -E env FMA_VA_DMA_HEAP=none
+                    sh ${CMAKE_SOURCE_DIR}/tests/va-roundtrip.sh
+                    $<TARGET_FILE:fake-media-acceld>
+                    $<TARGET_FILE:fma-va-driver-test>
+                    ${CMAKE_BINARY_DIR}/va-roundtrip-cpu-surface.sock)
         endif()
     endif()
 endif()

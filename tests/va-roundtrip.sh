@@ -6,7 +6,7 @@ test_binary=$2
 socket=$3
 
 rm -f "$socket"
-"$daemon" "$socket" --once &
+FMA_FAKE_DELAY_OUTPUT=1 "$daemon" "$socket" --once &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true; rm -f "$socket"' EXIT INT TERM
 

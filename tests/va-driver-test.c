@@ -81,6 +81,26 @@ int main(void) {
     CHECK(table.vaRenderPicture(&context, decoder, buffers, 3) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaEndPicture(&context, decoder) == VA_STATUS_SUCCESS);
+
+    /*
+     * The Android backend acknowledges input before MediaCodec necessarily
+     * emits its frame. Reusing a still-rendering surface must collect that
+     * pending output before the next picture replaces its routing identity.
+     */
+    picture.frame_num = 1;
+    picture.CurrPic.TopFieldOrderCnt = 2;
+    picture.CurrPic.BottomFieldOrderCnt = 2;
+    VAPictureParameterBufferH264 *mapped_picture = NULL;
+    CHECK(table.vaMapBuffer(&context, buffers[0],
+                            (void **)&mapped_picture) == VA_STATUS_SUCCESS);
+    CHECK(mapped_picture != NULL);
+    *mapped_picture = picture;
+    CHECK(table.vaUnmapBuffer(&context, buffers[0]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaBeginPicture(&context, decoder, surfaces[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, decoder, buffers, 3) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaEndPicture(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaSyncSurface(&context, surfaces[0]) == VA_STATUS_SUCCESS);
 
     VAImage image;

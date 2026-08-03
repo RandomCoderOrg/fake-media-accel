@@ -5,6 +5,7 @@
 #include <android/sharedmem.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
 #include <media/NdkMediaCodec.h>
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -24,6 +26,27 @@
 
 typedef bool (*binder_set_max_threads_fn)(uint32_t);
 typedef void (*binder_start_thread_pool_fn)(void);
+
+#ifndef DMA_BUF_IOCTL_SYNC
+struct dma_buf_sync {
+    uint64_t flags;
+};
+#define DMA_BUF_SYNC_WRITE (2u << 0)
+#define DMA_BUF_SYNC_START (0u << 2)
+#define DMA_BUF_SYNC_END (1u << 2)
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+#endif
+
+#define FMA_MAX_OUTPUT_TARGETS 64u
+
+struct output_target {
+    bool used;
+    int64_t pts_us;
+    int fd;
+    uint8_t *map;
+    size_t bytes;
+};
 
 struct decoder_session {
     uint64_t id;
@@ -44,6 +67,9 @@ struct decoder_session {
     uint64_t frame_bytes;
     uint64_t acquire_ns;
     uint64_t copy_ns;
+    bool logged_image_layout;
+    uint64_t direct_frames;
+    struct output_target targets[FMA_MAX_OUTPUT_TARGETS];
 };
 
 static volatile sig_atomic_t running = 1;
@@ -57,6 +83,72 @@ static uint64_t monotonic_ns(void) {
 static void on_signal(int signal_number) {
     (void)signal_number;
     running = 0;
+}
+
+static bool sync_dma_buf(int fd, uint64_t flags) {
+    struct dma_buf_sync sync = {.flags = flags};
+    int result;
+    do {
+        result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
+}
+
+static void release_target(struct output_target *target) {
+    if (!target->used)
+        return;
+    if (target->map && target->map != MAP_FAILED)
+        munmap(target->map, target->bytes);
+    if (target->fd >= 0)
+        close(target->fd);
+    memset(target, 0, sizeof(*target));
+    target->fd = -1;
+}
+
+static void clear_targets(struct decoder_session *session) {
+    for (unsigned i = 0; i < FMA_MAX_OUTPUT_TARGETS; ++i)
+        release_target(&session->targets[i]);
+}
+
+static struct output_target *find_target(struct decoder_session *session,
+                                         int64_t pts_us) {
+    for (unsigned i = 0; i < FMA_MAX_OUTPUT_TARGETS; ++i)
+        if (session->targets[i].used &&
+            session->targets[i].pts_us == pts_us)
+            return &session->targets[i];
+    return NULL;
+}
+
+static int register_target(struct decoder_session *session,
+                           struct fma_message *request) {
+    if (request->fd_count == 0)
+        return 0;
+    if (request->fd_count != 1 || request->fds[0] < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (unsigned i = 0; i < FMA_MAX_OUTPUT_TARGETS; ++i) {
+        struct output_target *target = &session->targets[i];
+        if (target->used)
+            continue;
+        int fd = request->fds[0];
+        uint8_t *map = mmap(NULL, session->pool.slot_size,
+                            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED)
+            return -1;
+        *target = (struct output_target) {
+            .used = true,
+            .pts_us = request->pts_us,
+            .fd = fd,
+            .map = map,
+            .bytes = session->pool.slot_size,
+        };
+        request->fds[0] = -1;
+        request->fd_count = 0;
+        return 0;
+    }
+    errno = EBUSY;
+    return -1;
 }
 
 static int start_binder_thread_pool(void) {
@@ -102,12 +194,14 @@ static int send_error(int fd, const struct fma_message *request, const char *tex
 static void destroy_decoder(struct decoder_session *session) {
     if (session->packets) {
         printf("metrics codec=%s packets=%llu input_bytes=%llu frames=%llu "
+               "direct_frames=%llu "
                "frame_bytes=%llu acquire_ms=%.3f copy_ms=%.3f "
                "socket_frame_bytes=0\n",
                fma_codec_name(session->codec_id),
                (unsigned long long)session->packets,
                (unsigned long long)session->input_bytes,
                (unsigned long long)session->frames,
+               (unsigned long long)session->direct_frames,
                (unsigned long long)session->frame_bytes,
                (double)session->acquire_ns / 1000000.0,
                (double)session->copy_ns / 1000000.0);
@@ -121,6 +215,7 @@ static void destroy_decoder(struct decoder_session *session) {
         AMediaFormat_delete(session->format);
     if (session->reader)
         AImageReader_delete(session->reader);
+    clear_targets(session);
     if (session->pool_map && session->pool_map != MAP_FAILED)
         munmap(session->pool_map, session->pool_bytes);
     if (session->pool_fd >= 0)
@@ -248,7 +343,8 @@ static int find_free_slot(struct decoder_session *session, uint32_t *slot_out) {
 }
 
 static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
-                              uint32_t slot, struct fma_frame *frame) {
+                              uint32_t slot, struct output_target *target,
+                              struct fma_frame *frame) {
     int32_t planes = 0;
     AImageCropRect crop;
     if (AImage_getNumberOfPlanes(image, &planes) != AMEDIA_OK || planes != 3 ||
@@ -272,7 +368,30 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
             return -1;
     }
 
-    uint8_t *destination = session->pool_map + (size_t)slot * session->pool.slot_size;
+    uintptr_t u_address = (uintptr_t)plane_data[1];
+    uintptr_t v_address = (uintptr_t)plane_data[2];
+    bool uv_interleaved = v_address == u_address + 1u &&
+                          pixel_stride[1] == 2 && pixel_stride[2] == 2 &&
+                          row_stride[1] == row_stride[2];
+    if (!session->logged_image_layout) {
+        const char *chroma_layout = uv_interleaved ? "UV-interleaved" :
+            u_address == v_address + 1u ? "VU-interleaved" : "separate";
+        fprintf(stderr,
+                "fma-android-layout crop=%dx%d+%d+%d "
+                "row_stride=%d,%d,%d pixel_stride=%d,%d,%d "
+                "plane_bytes=%d,%d,%d chroma=%s\n",
+                width, height, crop.left, crop.top, row_stride[0],
+                row_stride[1], row_stride[2], pixel_stride[0],
+                pixel_stride[1], pixel_stride[2], plane_length[0],
+                plane_length[1], plane_length[2], chroma_layout);
+        session->logged_image_layout = true;
+    }
+
+    uint8_t *destination = target ? target->map :
+        session->pool_map + (size_t)slot * session->pool.slot_size;
+    if (target && !sync_dma_buf(target->fd,
+                                DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE))
+        return -1;
     size_t y_size = (size_t)session->pool.stride * session->pool.height;
     memset(destination, 16, y_size);
     memset(destination + y_size, 128, y_size / 2);
@@ -287,7 +406,7 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
             for (int32_t x = 0; x < width; ++x) {
                 size_t source = source_row + (size_t)x * pixel_stride[0];
                 if (source >= (size_t)plane_length[0])
-                    return -1;
+                    goto fail;
                 destination[destination_row + (size_t)x] = plane_data[0][source];
             }
         }
@@ -298,17 +417,38 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
         size_t v_row = (size_t)(crop.top / 2 + y) * row_stride[2] +
                        (size_t)(crop.left / 2) * pixel_stride[2];
         size_t destination_row = y_size + (size_t)y * session->pool.stride;
+        if (uv_interleaved && width >= 2 && (width & 1) == 0) {
+            /*
+             * YUV_420_888 commonly exposes the U and V planes as adjacent
+             * views into an already interleaved NV12 row. Plane 1's reported
+             * length ends at its final U byte, so copy through that byte and
+             * take only the last V byte from plane 2 without reading beyond
+             * either public plane range.
+             */
+            size_t last_v = v_row + ((size_t)width / 2u - 1u) * 2u;
+            size_t prefix = (size_t)width - 1u;
+            if (u_row + prefix > (size_t)plane_length[1] ||
+                last_v >= (size_t)plane_length[2])
+                goto fail;
+            memcpy(destination + destination_row, plane_data[1] + u_row,
+                   prefix);
+            destination[destination_row + prefix] = plane_data[2][last_v];
+            continue;
+        }
         for (int32_t x = 0; x < width / 2; ++x) {
             size_t u = u_row + (size_t)x * pixel_stride[1];
             size_t v = v_row + (size_t)x * pixel_stride[2];
             if (u >= (size_t)plane_length[1] || v >= (size_t)plane_length[2])
-                return -1;
+                goto fail;
             destination[destination_row + (size_t)x * 2] = plane_data[1][u];
             destination[destination_row + (size_t)x * 2 + 1] = plane_data[2][v];
         }
     }
+    if (target && !sync_dma_buf(target->fd,
+                                DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE))
+        return -1;
     *frame = (struct fma_frame) {
-        .slot = slot,
+        .slot = target ? FMA_DIRECT_OUTPUT_SLOT : slot,
         .bytes_used = session->pool.slot_size,
         .width = (uint32_t)width,
         .height = (uint32_t)height,
@@ -316,6 +456,12 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
         .pixel_format = FMA_PIXFMT_NV12,
     };
     return 0;
+
+fail:
+    if (target)
+        (void)sync_dma_buf(target->fd,
+                           DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    return -1;
 }
 
 static int emit_output(int fd, const struct fma_message *request,
@@ -338,31 +484,41 @@ static int emit_output(int fd, const struct fma_message *request,
         empty_polls = 0;
         bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
         bool has_frame = info.size > 0;
+        bool direct_frame = false;
         if (AMediaCodec_releaseOutputBuffer(session->codec, (size_t)index,
                                             has_frame) != AMEDIA_OK)
             return -1;
         if (has_frame) {
             AImage *image = NULL;
             uint32_t slot = UINT32_MAX;
+            struct output_target *target =
+                find_target(session, info.presentationTimeUs);
             struct fma_frame frame;
             uint64_t started_ns = monotonic_ns();
-            int slot_status = find_free_slot(session, &slot);
+            int slot_status = target ? 0 : find_free_slot(session, &slot);
             int acquire_status = slot_status == 0 ?
                 acquire_image(session->reader, &image) : -1;
             session->acquire_ns += monotonic_ns() - started_ns;
             started_ns = monotonic_ns();
             int copy_status = acquire_status == 0 ?
-                copy_image_to_nv12(image, session, slot, &frame) : -1;
+                copy_image_to_nv12(image, session, slot, target, &frame) : -1;
             session->copy_ns += monotonic_ns() - started_ns;
             if (slot_status < 0 || acquire_status < 0 || copy_status < 0) {
                 if (image)
                     AImage_delete(image);
                 if (slot < session->pool.slot_count)
                     session->slots[slot] = false;
+                if (target)
+                    release_target(target);
                 return -1;
             }
             AImage_delete(image);
             session->frames++;
+            if (target) {
+                session->direct_frames++;
+                direct_frame = true;
+                release_target(target);
+            }
             session->frame_bytes += frame.bytes_used;
             uint8_t payload[24];
             fma_encode_frame(&frame, payload);
@@ -379,7 +535,7 @@ static int emit_output(int fd, const struct fma_message *request,
             return 2;
         }
         if (has_frame)
-            return 1;
+            return direct_frame ? 3 : 1;
         timeout_us = 0;
     }
 }
@@ -445,7 +601,7 @@ static int serve_client(int fd) {
                 .decoder_mask = probe_decoders(),
                 .pixel_format_mask = 1u << (FMA_PIXFMT_NV12 - 1u),
                 .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH |
-                         FMA_CAP_CAN_POLL,
+                         FMA_CAP_CAN_POLL | FMA_CAP_DIRECT_OUTPUT,
                 .max_width = 0,
                 .max_height = 0,
             };
@@ -478,12 +634,21 @@ static int serve_client(int fd) {
                 AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG : 0;
             session.packets++;
             session.input_bytes += request.payload_size;
-            if (!session.started || queue_input(&session, &request, flags) < 0 ||
-                emit_output(fd, &request, &session, 0, false) < 0)
+            bool wants_direct = request.fd_count != 0;
+            int target_status = wants_direct ?
+                register_target(&session, &request) : 0;
+            if (!session.started || target_status < 0 ||
+                queue_input(&session, &request, flags) < 0 ||
+                emit_output(fd, &request, &session, 0, false) < 0) {
+                struct output_target *target =
+                    find_target(&session, request.pts_us);
+                if (target)
+                    release_target(target);
                 result = send_error(fd, &request, "MediaCodec packet failed");
-            else
+            } else {
                 result = send_reply(fd, &request, FMA_MSG_PACKET_ACK, NULL, 0,
                                     session.id, -1);
+            }
             break;
         }
         case FMA_MSG_RELEASE_FRAME: {
@@ -499,6 +664,7 @@ static int serve_client(int fd) {
                 result = send_error(fd, &request, "MediaCodec flush failed");
             else {
                 memset(session.slots, 0, sizeof(session.slots));
+                clear_targets(&session);
                 result = send_reply(fd, &request, FMA_MSG_FLUSHED, NULL, 0,
                                     session.id, -1);
             }

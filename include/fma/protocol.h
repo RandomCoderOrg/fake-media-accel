@@ -10,7 +10,7 @@ extern "C" {
 
 #define FMA_MAGIC UINT32_C(0x31414d46) /* FMA1 on a little-endian wire. */
 #define FMA_PROTOCOL_MAJOR 1u
-#define FMA_PROTOCOL_MINOR 1u
+#define FMA_PROTOCOL_MINOR 2u
 #define FMA_WIRE_HEADER_SIZE 48u
 #define FMA_MAX_PAYLOAD (8u * 1024u * 1024u)
 #define FMA_MAX_FDS 4u
@@ -18,6 +18,7 @@ extern "C" {
 #define FMA_MAX_SLOTS 8u
 #define FMA_MAX_DIMENSION 8192u
 #define FMA_MAX_POOL_BYTES (UINT64_C(512) * 1024u * 1024u)
+#define FMA_DIRECT_OUTPUT_SLOT UINT32_MAX
 
 enum fma_message_type {
     FMA_MSG_HELLO = 1,
@@ -64,6 +65,7 @@ enum fma_capability_flags {
     FMA_CAP_SHARED_FRAME_POOL = 1u << 0,
     FMA_CAP_CAN_FLUSH = 1u << 1,
     FMA_CAP_CAN_POLL = 1u << 2,
+    FMA_CAP_DIRECT_OUTPUT = 1u << 3,
 };
 
 struct fma_message {

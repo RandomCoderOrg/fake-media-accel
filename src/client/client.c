@@ -6,9 +6,10 @@
 #include <string.h>
 #include <unistd.h>
 
-static int send_simple(struct fma_client *client, uint16_t type,
-                       const void *payload, uint32_t payload_size,
-                       int64_t pts_us, uint32_t flags, uint64_t *request_id) {
+static int send_with_fd(struct fma_client *client, uint16_t type,
+                        const void *payload, uint32_t payload_size,
+                        int64_t pts_us, uint32_t flags, int passed_fd,
+                        uint64_t *request_id) {
     struct fma_message message;
     fma_message_init(&message, type);
     message.flags = flags;
@@ -17,9 +18,20 @@ static int send_simple(struct fma_client *client, uint16_t type,
     message.request_id = client->next_request_id++;
     message.session_id = client->session_id;
     message.pts_us = pts_us;
+    if (passed_fd >= 0) {
+        message.fd_count = 1;
+        message.fds[0] = passed_fd;
+    }
     if (request_id)
         *request_id = message.request_id;
     return fma_send_message(client->socket_fd, &message);
+}
+
+static int send_simple(struct fma_client *client, uint16_t type,
+                       const void *payload, uint32_t payload_size,
+                       int64_t pts_us, uint32_t flags, uint64_t *request_id) {
+    return send_with_fd(client, type, payload, payload_size, pts_us, flags, -1,
+                        request_id);
 }
 
 static int expect(struct fma_client *client, uint16_t type, uint64_t request_id,
@@ -119,12 +131,18 @@ int fma_client_create_decoder(struct fma_client *client,
 
 int fma_client_queue_packet(struct fma_client *client, const void *data,
                             size_t size, int64_t pts_us, uint32_t flags) {
+    return fma_client_queue_packet_to(client, data, size, pts_us, flags, -1);
+}
+
+int fma_client_queue_packet_to(struct fma_client *client, const void *data,
+                               size_t size, int64_t pts_us, uint32_t flags,
+                               int output_fd) {
     if (!data || size == 0 || size > FMA_MAX_PAYLOAD) {
         errno = EINVAL;
         return -1;
     }
-    return send_simple(client, FMA_MSG_QUEUE_PACKET, data, (uint32_t)size,
-                       pts_us, flags, NULL);
+    return send_with_fd(client, FMA_MSG_QUEUE_PACKET, data, (uint32_t)size,
+                        pts_us, flags, output_fd, NULL);
 }
 
 int fma_client_drain(struct fma_client *client) {

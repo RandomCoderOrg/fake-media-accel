@@ -22,6 +22,10 @@ struct fake_session {
     size_t pool_bytes;
     uint32_t next_slot;
     bool slots[FMA_MAX_SLOTS];
+    bool delay_output;
+    bool direct_output;
+    bool have_pending;
+    struct fma_message pending;
 };
 
 static volatile sig_atomic_t running = 1;
@@ -80,6 +84,13 @@ static void destroy_pool(struct fake_session *session) {
     session->pool_bytes = 0;
 }
 
+static void clear_pending(struct fake_session *session) {
+    if (session->have_pending)
+        fma_message_release(&session->pending);
+    memset(&session->pending, 0, sizeof(session->pending));
+    session->have_pending = false;
+}
+
 static int create_pool(struct fake_session *session,
                        const struct fma_decoder_config *config) {
     destroy_pool(session);
@@ -114,23 +125,38 @@ static int create_pool(struct fake_session *session,
 
 static int emit_frame(int fd, const struct fma_message *request,
                       struct fake_session *session) {
-    uint32_t slot = session->next_slot;
-    for (uint32_t i = 0; i < session->pool.slot_count; ++i) {
-        slot = (session->next_slot + i) % session->pool.slot_count;
-        if (!session->slots[slot])
-            goto found;
-    }
-    return send_error(fd, request, "frame pool exhausted");
+    bool direct_output = request->fd_count == 1 && request->fds[0] >= 0;
+    if (request->fd_count > 1)
+        return send_error(fd, request, "too many output buffers");
+    uint32_t slot = FMA_DIRECT_OUTPUT_SLOT;
+    uint8_t *pixels = NULL;
+    if (direct_output) {
+        pixels = mmap(NULL, session->pool.slot_size, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, request->fds[0], 0);
+        if (pixels == MAP_FAILED)
+            return send_error(fd, request, "cannot map direct output");
+    } else {
+        slot = session->next_slot;
+        for (uint32_t i = 0; i < session->pool.slot_count; ++i) {
+            slot = (session->next_slot + i) % session->pool.slot_count;
+            if (!session->slots[slot])
+                goto found;
+        }
+        return send_error(fd, request, "frame pool exhausted");
 
 found:
-    session->slots[slot] = true;
-    session->next_slot = (slot + 1) % session->pool.slot_count;
-    uint8_t *pixels = session->pool_map + (size_t)slot * session->pool.slot_size;
+        session->slots[slot] = true;
+        session->next_slot = (slot + 1) % session->pool.slot_count;
+        pixels = session->pool_map +
+            (size_t)slot * session->pool.slot_size;
+    }
     for (uint32_t y = 0; y < session->pool.height; ++y)
         memset(pixels + (size_t)y * session->pool.stride,
                (uint8_t)(16 + request->request_id % 220), session->pool.width);
     uint8_t *uv = pixels + (size_t)session->pool.stride * session->pool.height;
     memset(uv, 128, (size_t)session->pool.stride * session->pool.height / 2);
+    if (direct_output)
+        munmap(pixels, session->pool.slot_size);
 
     struct fma_frame frame = {
         .slot = slot,
@@ -147,7 +173,16 @@ found:
 }
 
 static int handle_client(int fd) {
-    struct fake_session session = {.id = 1, .pool_fd = -1};
+    const char *delay_value = getenv("FMA_FAKE_DELAY_OUTPUT");
+    const char *direct_value = getenv("FMA_FAKE_DIRECT_OUTPUT");
+    struct fake_session session = {
+        .id = 1,
+        .pool_fd = -1,
+        .delay_output = delay_value && *delay_value &&
+                        strcmp(delay_value, "0") != 0,
+        .direct_output = !direct_value || !*direct_value ||
+                         strcmp(direct_value, "0") != 0,
+    };
     int result = 0;
     while (running) {
         struct fma_message request;
@@ -178,7 +213,8 @@ static int handle_client(int fd) {
                                 FMA_CODEC_BIT(FMA_CODEC_AV1),
                 .pixel_format_mask = 1u << (FMA_PIXFMT_NV12 - 1u),
                 .flags = FMA_CAP_SHARED_FRAME_POOL | FMA_CAP_CAN_FLUSH |
-                         FMA_CAP_CAN_POLL,
+                         FMA_CAP_CAN_POLL |
+                         (session.direct_output ? FMA_CAP_DIRECT_OUTPUT : 0),
                 .max_width = 8192,
                 .max_height = 8192,
             };
@@ -207,10 +243,31 @@ static int handle_client(int fd) {
             break;
         }
         case FMA_MSG_QUEUE_PACKET:
-            result = emit_frame(fd, &request, &session);
-            if (result == 0)
+            if (session.delay_output) {
+                if (session.have_pending) {
+                    result = send_error(fd, &request,
+                                        "previous frame was not collected");
+                    break;
+                }
+                fma_message_init(&session.pending, FMA_MSG_QUEUE_PACKET);
+                session.pending.request_id = request.request_id;
+                session.pending.session_id = request.session_id;
+                session.pending.pts_us = request.pts_us;
+                if (request.fd_count == 1) {
+                    session.pending.fd_count = 1;
+                    session.pending.fds[0] = request.fds[0];
+                    request.fds[0] = -1;
+                    request.fd_count = 0;
+                }
+                session.have_pending = true;
                 result = send_reply(fd, &request, FMA_MSG_PACKET_ACK, NULL, 0,
                                     session.id, -1);
+            } else {
+                result = emit_frame(fd, &request, &session);
+                if (result == 0)
+                    result = send_reply(fd, &request, FMA_MSG_PACKET_ACK,
+                                        NULL, 0, session.id, -1);
+            }
             break;
         case FMA_MSG_RELEASE_FRAME: {
             uint32_t slot = request.payload_size == 4 ? fma_get_u32(request.payload) : 16;
@@ -222,22 +279,35 @@ static int handle_client(int fd) {
         }
         case FMA_MSG_FLUSH:
             memset(session.slots, 0, sizeof(session.slots));
+            clear_pending(&session);
             result = send_reply(fd, &request, FMA_MSG_FLUSHED, NULL, 0,
                                 session.id, -1);
             break;
         case FMA_MSG_DRAIN:
-            result = send_reply(fd, &request, FMA_MSG_OUTPUT_EOS, NULL, 0,
-                                session.id, -1);
+            if (session.have_pending) {
+                result = emit_frame(fd, &session.pending, &session);
+                clear_pending(&session);
+            }
+            if (result == 0)
+                result = send_reply(fd, &request, FMA_MSG_OUTPUT_EOS, NULL, 0,
+                                    session.id, -1);
             break;
         case FMA_MSG_POLL_OUTPUT:
             if (request.payload_size != 4)
                 result = send_error(fd, &request, "invalid poll request");
-            else
-                result = send_reply(fd, &request, FMA_MSG_POLL_DONE, NULL, 0,
-                                    session.id, -1);
+            else {
+                if (session.have_pending) {
+                    result = emit_frame(fd, &session.pending, &session);
+                    clear_pending(&session);
+                }
+                if (result == 0)
+                    result = send_reply(fd, &request, FMA_MSG_POLL_DONE, NULL,
+                                        0, session.id, -1);
+            }
             break;
         case FMA_MSG_CLOSE:
             fma_message_release(&request);
+            clear_pending(&session);
             destroy_pool(&session);
             return 0;
         default:
@@ -248,6 +318,7 @@ static int handle_client(int fd) {
         if (result < 0)
             break;
     }
+    clear_pending(&session);
     destroy_pool(&session);
     return result;
 }

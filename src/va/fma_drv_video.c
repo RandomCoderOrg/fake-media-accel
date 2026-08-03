@@ -5,16 +5,63 @@
 #include "h264_timing.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <va/va_backend.h>
+#include <va/va_drmcommon.h>
+
+#if defined(__has_include)
+#if __has_include(<linux/dma-buf.h>)
+#include <linux/dma-buf.h>
+#endif
+#if __has_include(<linux/dma-heap.h>)
+#include <linux/dma-heap.h>
+#endif
+#endif
+
+#ifndef DMA_HEAP_IOCTL_ALLOC
+struct dma_heap_allocation_data {
+    uint64_t len;
+    uint32_t fd;
+    uint32_t fd_flags;
+    uint64_t heap_flags;
+};
+#define DMA_HEAP_IOC_MAGIC 'H'
+#define DMA_HEAP_IOCTL_ALLOC                                                   \
+    _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+#endif
+
+#ifndef DMA_BUF_IOCTL_SYNC
+struct dma_buf_sync {
+    uint64_t flags;
+};
+#define DMA_BUF_SYNC_READ (1u << 0)
+#define DMA_BUF_SYNC_WRITE (2u << 0)
+#define DMA_BUF_SYNC_RW (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START (0u << 2)
+#define DMA_BUF_SYNC_END (1u << 2)
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+#endif
+
+#define FMA_DRM_FOURCC(a, b, c, d)                                            \
+    ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) |           \
+     ((uint32_t)(d) << 24))
+#define FMA_DRM_FORMAT_R8 FMA_DRM_FOURCC('R', '8', ' ', ' ')
+#define FMA_DRM_FORMAT_GR88 FMA_DRM_FOURCC('G', 'R', '8', '8')
+#define FMA_DRM_FORMAT_NV12 FMA_DRM_FOURCC('N', 'V', '1', '2')
+#define FMA_DRM_FORMAT_MOD_LINEAR UINT64_C(0)
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -37,15 +84,22 @@ struct va_surface {
     bool used;
     unsigned width;
     unsigned height;
+    unsigned allocation_height;
     unsigned stride;
+    size_t uv_offset;
     size_t size;
     uint8_t *data;
+    int dma_buf_fd;
     int64_t pts_us;
     VASurfaceStatus status;
+    unsigned derived_images;
+    unsigned external_handles;
 };
 
 struct va_context {
     bool used;
+    bool io_lock_initialized;
+    pthread_mutex_t io_lock;
     VAConfigID config_id;
     unsigned width;
     unsigned height;
@@ -63,6 +117,8 @@ struct va_context {
     VASliceParameterBufferH264 first_slice;
     bool have_picture;
     bool have_first_slice;
+    bool direct_output;
+    uint64_t stored_frames;
 };
 
 struct va_buffer {
@@ -72,14 +128,35 @@ struct va_buffer {
     unsigned elements;
     void *data;
     bool owns_data;
+    VASurfaceID derived_surface;
+    bool mapped;
+    int exported_fd;
+    bool acquired;
 };
 
 struct va_image {
     bool used;
     VAImage image;
+    VASurfaceID derived_surface;
 };
 
 struct va_driver {
+    uint64_t initialized_ns;
+    uint64_t submitted_frames;
+    uint64_t submission_ns;
+    uint64_t stored_frames;
+    uint64_t direct_frames;
+    uint64_t store_copy_bytes;
+    uint64_t store_copy_ns;
+    uint64_t sync_calls;
+    uint64_t sync_ns;
+    uint64_t derive_calls;
+    uint64_t derive_ns;
+    uint64_t surface_map_calls;
+    uint64_t acquire_handle_calls;
+    uint64_t get_image_calls;
+    uint64_t get_image_bytes;
+    uint64_t get_image_ns;
     struct va_config configs[FMA_VA_MAX_CONFIGS];
     struct va_surface surfaces[FMA_VA_MAX_SURFACES];
     struct va_context contexts[FMA_VA_MAX_CONTEXTS];
@@ -90,6 +167,23 @@ struct va_driver {
 static bool debug_enabled(void) {
     const char *value = getenv("FMA_VA_DEBUG");
     return value && *value && strcmp(value, "0") != 0;
+}
+
+static bool metrics_enabled(void) {
+    const char *value = getenv("FMA_VA_METRICS");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static uint64_t monotonic_ns(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+        return 0;
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)value.tv_nsec;
+}
+
+static double driver_elapsed_ms(const struct va_driver *driver) {
+    return (double)(monotonic_ns() - driver->initialized_ns) / 1000000.0;
 }
 
 static void dump_packet(const uint8_t *packet, size_t packet_size) {
@@ -130,6 +224,111 @@ static struct va_buffer *get_buffer(struct va_driver *driver, VABufferID id) {
         &driver->buffers[id - 1] : NULL;
 }
 
+static VAImageFormat nv12_image_format(void) {
+    VAImageFormat format;
+    memset(&format, 0, sizeof(format));
+    format.fourcc = VA_FOURCC_NV12;
+    format.byte_order = VA_LSB_FIRST;
+    format.bits_per_pixel = 12;
+    return format;
+}
+
+static bool nv12_layout(unsigned width, unsigned height, unsigned pitch,
+                        size_t *y_size, size_t *bytes) {
+    if (!width || !height || pitch < width || (pitch & 1u) ||
+        (size_t)pitch > SIZE_MAX / height)
+        return false;
+    size_t y = (size_t)pitch * height;
+    unsigned chroma_rows = (height + 1u) / 2u;
+    if ((size_t)pitch > SIZE_MAX / chroma_rows)
+        return false;
+    size_t uv = (size_t)pitch * chroma_rows;
+    if (uv > SIZE_MAX - y || y + uv > UINT_MAX)
+        return false;
+    if (y_size)
+        *y_size = y;
+    if (bytes)
+        *bytes = y + uv;
+    return true;
+}
+
+static const char *dma_heap_path(void) {
+    const char *path = getenv("FMA_VA_DMA_HEAP");
+    if (path && (!*path || strcmp(path, "0") == 0 ||
+                 strcmp(path, "none") == 0))
+        return NULL;
+    return path ? path : "/dev/dma_heap/system";
+}
+
+static bool dma_heap_available(void) {
+    const char *path = dma_heap_path();
+    if (!path)
+        return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    close(fd);
+    return true;
+}
+
+static int allocate_dma_buf(size_t bytes) {
+    const char *path = dma_heap_path();
+    if (!path)
+        return -1;
+    int heap_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (heap_fd < 0)
+        return -1;
+    struct dma_heap_allocation_data allocation;
+    memset(&allocation, 0, sizeof(allocation));
+    allocation.len = bytes;
+    allocation.fd_flags = O_RDWR | O_CLOEXEC;
+    int result;
+    do {
+        result = ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &allocation);
+    } while (result < 0 && errno == EINTR);
+    int saved = errno;
+    close(heap_fd);
+    if (result < 0) {
+        errno = saved;
+        return -1;
+    }
+    return (int)allocation.fd;
+}
+
+static bool sync_dma_buf(int fd, uint64_t flags) {
+    if (fd < 0)
+        return true;
+    struct dma_buf_sync sync = {.flags = flags};
+    int result;
+    do {
+        result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && debug_enabled())
+        perror("fma-va: DMA_BUF_IOCTL_SYNC");
+    return result == 0;
+}
+
+static bool begin_surface_cpu_access(struct va_surface *surface,
+                                     uint64_t access) {
+    return sync_dma_buf(surface->dma_buf_fd, DMA_BUF_SYNC_START | access);
+}
+
+static bool end_surface_cpu_access(struct va_surface *surface,
+                                   uint64_t access) {
+    return sync_dma_buf(surface->dma_buf_fd, DMA_BUF_SYNC_END | access);
+}
+
+static void release_surface(struct va_surface *surface) {
+    if (surface->dma_buf_fd >= 0) {
+        if (surface->data && surface->data != MAP_FAILED)
+            munmap(surface->data, surface->size);
+        close(surface->dma_buf_fd);
+    } else {
+        free(surface->data);
+    }
+    memset(surface, 0, sizeof(*surface));
+}
+
 static bool profile_supported(VAProfile profile) {
     return profile == VAProfileH264ConstrainedBaseline ||
            profile == VAProfileH264Main || profile == VAProfileH264High;
@@ -168,6 +367,8 @@ static void close_context(struct va_context *context) {
     if (context->pool_fd >= 0)
         close(context->pool_fd);
     free(context->slices);
+    if (context->io_lock_initialized)
+        pthread_mutex_destroy(&context->io_lock);
     memset(context, 0, sizeof(*context));
     context->client.socket_fd = -1;
     context->pool_fd = -1;
@@ -176,9 +377,12 @@ static void close_context(struct va_context *context) {
 static bool store_frame(struct va_driver *driver, struct va_context *context,
                         const struct fma_message *message) {
     struct fma_frame frame;
-    if (fma_decode_frame(message->payload, message->payload_size, &frame) < 0 ||
-        frame.slot >= context->pool.slot_count ||
-        frame.bytes_used > context->pool.slot_size)
+    if (fma_decode_frame(message->payload, message->payload_size, &frame) < 0)
+        return false;
+    bool direct_output = frame.slot == FMA_DIRECT_OUTPUT_SLOT;
+    if (!direct_output &&
+        (frame.slot >= context->pool.slot_count ||
+         frame.bytes_used > context->pool.slot_size))
         return false;
     struct va_surface *surface = NULL;
     for (unsigned i = 0; i < FMA_VA_MAX_SURFACES; ++i) {
@@ -188,34 +392,103 @@ static bool store_frame(struct va_driver *driver, struct va_context *context,
             break;
         }
     }
-    bool valid = true;
+    bool valid = surface != NULL;
+    uint8_t sample_y0 = 0;
+    uint8_t sample_yc = 0;
+    uint8_t sample_u0 = 0;
+    uint8_t sample_v0 = 0;
+    uint8_t sample_uc = 0;
+    uint8_t sample_vc = 0;
+    uint64_t copy_started_ns = 0;
     if (surface) {
-        if (frame.width > surface->width || frame.height > surface->height ||
+        if (frame.width > surface->stride ||
+            frame.height > surface->allocation_height ||
             frame.stride < frame.width || frame.pixel_format != FMA_PIXFMT_NV12)
             valid = false;
-        else {
+        else if (direct_output) {
+            if (surface->dma_buf_fd < 0 || frame.bytes_used > surface->size)
+                valid = false;
+            else {
+                surface->status = VASurfaceReady;
+                driver->stored_frames++;
+                driver->direct_frames++;
+            }
+        } else if ((copy_started_ns = monotonic_ns(),
+                  !begin_surface_cpu_access(surface, DMA_BUF_SYNC_WRITE))) {
+            valid = false;
+        } else {
             const uint8_t *source = context->pool_map +
                 (size_t)frame.slot * context->pool.slot_size;
             size_t source_y = (size_t)frame.stride * context->pool.height;
-            size_t destination_y = (size_t)surface->stride * surface->height;
-            memset(surface->data, 16, destination_y);
-            memset(surface->data + destination_y, 128, destination_y / 2);
-            for (uint32_t row = 0; row < frame.height; ++row)
-                memcpy(surface->data + (size_t)row * surface->stride,
-                       source + (size_t)row * frame.stride, frame.width);
-            for (uint32_t row = 0; row < frame.height / 2; ++row)
-                memcpy(surface->data + destination_y +
-                           (size_t)row * surface->stride,
-                       source + source_y + (size_t)row * frame.stride,
-                       frame.width);
-            surface->status = VASurfaceReady;
+            size_t destination_y = surface->uv_offset;
+            bool identical_layout = frame.width == frame.stride &&
+                frame.stride == surface->stride &&
+                frame.height == context->pool.height &&
+                frame.height == surface->allocation_height &&
+                source_y == destination_y && frame.bytes_used >= surface->size;
+            if (identical_layout) {
+                memcpy(surface->data, source, surface->size);
+            } else {
+                memset(surface->data, 16, destination_y);
+                memset(surface->data + destination_y, 128,
+                       surface->size - destination_y);
+                for (uint32_t row = 0; row < frame.height; ++row)
+                    memcpy(surface->data + (size_t)row * surface->stride,
+                           source + (size_t)row * frame.stride, frame.width);
+                for (uint32_t row = 0; row < frame.height / 2; ++row)
+                    memcpy(surface->data + destination_y +
+                               (size_t)row * surface->stride,
+                           source + source_y + (size_t)row * frame.stride,
+                           frame.width);
+            }
+            unsigned center_x = (frame.width / 2u) & ~1u;
+            unsigned center_y = frame.height / 2u;
+            unsigned center_uv_y = frame.height / 4u;
+            sample_y0 = surface->data[0];
+            sample_yc = surface->data[(size_t)center_y * surface->stride +
+                                      center_x];
+            sample_u0 = surface->data[destination_y];
+            sample_v0 = surface->data[destination_y + 1];
+            sample_uc = surface->data[destination_y +
+                                      (size_t)center_uv_y * surface->stride +
+                                      center_x];
+            sample_vc = surface->data[destination_y +
+                                      (size_t)center_uv_y * surface->stride +
+                                      center_x + 1];
+            if (!end_surface_cpu_access(surface, DMA_BUF_SYNC_WRITE))
+                valid = false;
+            else
+                surface->status = VASurfaceReady;
         }
     }
-    if (debug_enabled())
+    if (copy_started_ns) {
+        driver->store_copy_ns += monotonic_ns() - copy_started_ns;
+        if (valid) {
+            driver->stored_frames++;
+            driver->store_copy_bytes +=
+                (uint64_t)frame.width * frame.height * 3u / 2u;
+        }
+    }
+    ++context->stored_frames;
+    if (debug_enabled()) {
         fprintf(stderr, "fma-va: frame pts=%lld slot=%u matched=%d\n",
                 (long long)message->pts_us, frame.slot, surface != NULL);
-    if (fma_client_release_frame(&context->client, frame.slot) < 0)
+        if (surface && (context->stored_frames <= 8 ||
+                        context->stored_frames % 30 == 0))
+            fprintf(stderr,
+                    "fma-va: sample frame=%llu visible=%ux%u stride=%u "
+                    "storage_h=%u y0=%u yc=%u uv0=%u,%u uvc=%u,%u\n",
+                    (unsigned long long)context->stored_frames, frame.width,
+                    frame.height, frame.stride, surface->allocation_height,
+                    sample_y0, sample_yc, sample_u0, sample_v0, sample_uc,
+                    sample_vc);
+    }
+    if (!direct_output &&
+        fma_client_release_frame(&context->client, frame.slot) < 0) {
+        if (debug_enabled())
+            perror("fma-va: release frame");
         return false;
+    }
     return valid;
 }
 
@@ -223,17 +496,34 @@ static bool process_until(struct va_driver *driver, struct va_context *context,
                           uint16_t terminal) {
     for (;;) {
         struct fma_message message;
-        if (fma_client_receive(&context->client, &message) < 0)
+        if (fma_client_receive(&context->client, &message) < 0) {
+            if (debug_enabled())
+                perror("fma-va: receive");
             return false;
+        }
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: io type=%u terminal=%u request=%llu pts=%lld\n",
+                    message.type, terminal,
+                    (unsigned long long)message.request_id,
+                    (long long)message.pts_us);
         bool valid = true;
         if (message.type == FMA_MSG_FRAME_READY)
             valid = store_frame(driver, context, &message);
-        else if (message.type == FMA_MSG_ERROR)
+        else if (message.type == FMA_MSG_ERROR) {
+            if (debug_enabled())
+                fprintf(stderr, "fma-va: daemon error: %.*s\n",
+                        (int)message.payload_size,
+                        message.payload ? (const char *)message.payload : "");
             valid = false;
+        }
         bool done = message.type == terminal;
         fma_message_release(&message);
-        if (!valid)
+        if (!valid) {
+            if (debug_enabled())
+                fprintf(stderr, "fma-va: message processing failed\n");
             return false;
+        }
         if (done)
             return true;
     }
@@ -243,14 +533,44 @@ static VAStatus terminate(VADriverContextP ctx) {
     struct va_driver *driver = ctx->pDriverData;
     if (!driver)
         return VA_STATUS_SUCCESS;
+    if (metrics_enabled())
+        fprintf(stderr,
+                "fma-va-metrics submitted=%llu submission_ms=%.3f "
+                "stored=%llu direct=%llu store_copy_mib=%.3f "
+                "store_copy_ms=%.3f "
+                "sync_calls=%llu sync_ms=%.3f derive_calls=%llu "
+                "derive_ms=%.3f surface_maps=%llu acquire_handles=%llu "
+                "get_image_calls=%llu get_image_mib=%.3f "
+                "get_image_ms=%.3f\n",
+                (unsigned long long)driver->submitted_frames,
+                (double)driver->submission_ns / 1000000.0,
+                (unsigned long long)driver->stored_frames,
+                (unsigned long long)driver->direct_frames,
+                (double)driver->store_copy_bytes / (1024.0 * 1024.0),
+                (double)driver->store_copy_ns / 1000000.0,
+                (unsigned long long)driver->sync_calls,
+                (double)driver->sync_ns / 1000000.0,
+                (unsigned long long)driver->derive_calls,
+                (double)driver->derive_ns / 1000000.0,
+                (unsigned long long)driver->surface_map_calls,
+                (unsigned long long)driver->acquire_handle_calls,
+                (unsigned long long)driver->get_image_calls,
+                (double)driver->get_image_bytes / (1024.0 * 1024.0),
+                (double)driver->get_image_ns / 1000000.0);
     for (unsigned i = 0; i < FMA_VA_MAX_CONTEXTS; ++i)
         if (driver->contexts[i].used)
             close_context(&driver->contexts[i]);
     for (unsigned i = 0; i < FMA_VA_MAX_SURFACES; ++i)
-        free(driver->surfaces[i].data);
+        if (driver->surfaces[i].used)
+            release_surface(&driver->surfaces[i]);
     for (unsigned i = 0; i < FMA_VA_MAX_BUFFERS; ++i)
-        if (driver->buffers[i].owns_data)
-            free(driver->buffers[i].data);
+        if (driver->buffers[i].used) {
+            if (driver->buffers[i].acquired &&
+                driver->buffers[i].exported_fd >= 0)
+                close(driver->buffers[i].exported_fd);
+            if (driver->buffers[i].owns_data)
+                free(driver->buffers[i].data);
+        }
     free(driver);
     ctx->pDriverData = NULL;
     return VA_STATUS_SUCCESS;
@@ -354,6 +674,7 @@ static VAStatus query_config_attributes(VADriverContextP ctx, VAConfigID id,
 
 static VAStatus destroy_surfaces(VADriverContextP ctx, VASurfaceID *ids,
                                  int count);
+static VAStatus sync_surface(VADriverContextP ctx, VASurfaceID id);
 
 static VAStatus create_surfaces(VADriverContextP ctx, int width, int height,
                                 int format, int count, VASurfaceID *ids) {
@@ -363,23 +684,54 @@ static VAStatus create_surfaces(VADriverContextP ctx, int width, int height,
     if (!(format & VA_RT_FORMAT_YUV420))
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     unsigned stride = ((unsigned)width + 63u) & ~63u;
-    if ((size_t)stride > SIZE_MAX / (unsigned)height)
+    unsigned allocation_height = ((unsigned)height + 15u) & ~15u;
+    size_t uv_offset;
+    size_t bytes;
+    if (!nv12_layout((unsigned)width, allocation_height, stride, &uv_offset,
+                     &bytes))
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    size_t y_size = (size_t)stride * (unsigned)height;
-    size_t bytes = y_size + y_size / 2;
     int created = 0;
     for (unsigned i = 0; i < FMA_VA_MAX_SURFACES && created < count; ++i) {
         if (driver->surfaces[i].used)
             continue;
-        uint8_t *data = malloc(bytes);
-        if (!data)
-            break;
-        memset(data, 0, bytes);
-        driver->surfaces[i] = (struct va_surface) {
+        struct va_surface surface = {
             .used = true, .width = (unsigned)width,
-            .height = (unsigned)height, .stride = stride, .size = bytes,
-            .data = data, .pts_us = -1, .status = VASurfaceReady,
+            .height = (unsigned)height,
+            .allocation_height = allocation_height,
+            .stride = stride, .uv_offset = uv_offset, .size = bytes,
+            .dma_buf_fd = -1, .pts_us = -1, .status = VASurfaceReady,
         };
+        surface.dma_buf_fd = allocate_dma_buf(bytes);
+        if (surface.dma_buf_fd >= 0) {
+            surface.data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                surface.dma_buf_fd, 0);
+            if (surface.data == MAP_FAILED ||
+                !begin_surface_cpu_access(&surface, DMA_BUF_SYNC_WRITE)) {
+                if (surface.data == MAP_FAILED)
+                    surface.data = NULL;
+                release_surface(&surface);
+                surface.dma_buf_fd = -1;
+            } else {
+                memset(surface.data, 0, bytes);
+                if (!end_surface_cpu_access(&surface, DMA_BUF_SYNC_WRITE)) {
+                    release_surface(&surface);
+                    surface.dma_buf_fd = -1;
+                }
+            }
+        }
+        if (surface.dma_buf_fd < 0) {
+            surface.data = calloc(1, bytes);
+            if (!surface.data)
+                break;
+        }
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: surface %ux%u storage=%ux%u backing=%s "
+                    "bytes=%zu\n",
+                    surface.width, surface.height, surface.stride,
+                    surface.allocation_height,
+                    surface.dma_buf_fd >= 0 ? "dma-buf" : "malloc", bytes);
+        driver->surfaces[i] = surface;
         ids[created++] = i + 1;
     }
     if (created == count)
@@ -397,8 +749,12 @@ static VAStatus destroy_surfaces(VADriverContextP ctx, VASurfaceID *ids,
         struct va_surface *surface = get_surface(driver, ids[i]);
         if (!surface)
             return VA_STATUS_ERROR_INVALID_SURFACE;
-        free(surface->data);
-        memset(surface, 0, sizeof(*surface));
+        if (surface->derived_images || surface->external_handles)
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    for (int i = 0; i < count; ++i) {
+        struct va_surface *surface = get_surface(driver, ids[i]);
+        release_surface(surface);
     }
     return VA_STATUS_SUCCESS;
 }
@@ -409,11 +765,17 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
                                VAContextID *id) {
     (void)flags;
     struct va_driver *driver = ctx->pDriverData;
+    uint64_t started_ns = monotonic_ns();
     if (!id || width <= 0 || height <= 0 || !get_config(driver, config_id))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    for (int i = 0; i < target_count; ++i)
-        if (!get_surface(driver, targets[i]))
+    for (int i = 0; i < target_count; ++i) {
+        struct va_surface *surface = get_surface(driver, targets[i]);
+        if (!surface)
             return VA_STATUS_ERROR_INVALID_SURFACE;
+        if ((unsigned)width > surface->stride ||
+            (unsigned)height > surface->allocation_height)
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     for (unsigned i = 0; i < FMA_VA_MAX_CONTEXTS; ++i) {
         if (driver->contexts[i].used)
             continue;
@@ -421,6 +783,9 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         memset(context, 0, sizeof(*context));
         context->client.socket_fd = -1;
         context->pool_fd = -1;
+        if (pthread_mutex_init(&context->io_lock, NULL) != 0)
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        context->io_lock_initialized = true;
         const char *socket_path = getenv("FMA_SOCKET");
         if (!socket_path || !*socket_path)
             socket_path = "/tmp/fake-media-accel.sock";
@@ -428,10 +793,14 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
             .codec = FMA_CODEC_H264, .width = (uint32_t)width,
             .height = (uint32_t)height, .slot_count = FMA_MAX_SLOTS,
         };
+        struct fma_capabilities caps;
         if (fma_client_connect(&context->client, socket_path) < 0 ||
+            fma_client_query_capabilities(&context->client, &caps) < 0 ||
             fma_client_create_decoder(&context->client, &config,
                                       &context->pool, &context->pool_fd) < 0)
             goto fail;
+        context->direct_output =
+            (caps.flags & FMA_CAP_DIRECT_OUTPUT) != 0;
         context->pool_bytes =
             (size_t)context->pool.slot_size * context->pool.slot_count;
         context->pool_map = mmap(NULL, context->pool_bytes, PROT_READ,
@@ -446,6 +815,12 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         context->height = (unsigned)height;
         context->target = VA_INVALID_ID;
         *id = i + 1;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: created context=%u duration_ms=%.3f "
+                    "elapsed_ms=%.3f\n",
+                    *id, (double)(monotonic_ns() - started_ns) / 1000000.0,
+                    driver_elapsed_ms(driver));
         return VA_STATUS_SUCCESS;
 fail:
         close_context(context);
@@ -455,11 +830,24 @@ fail:
 }
 
 static VAStatus destroy_context(VADriverContextP ctx, VAContextID id) {
-    struct va_context *context = get_context(ctx->pDriverData, id);
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_context *context = get_context(driver, id);
     if (!context)
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    uint64_t started_ns = monotonic_ns();
+    pthread_mutex_lock(&context->io_lock);
+    bool drained = fma_client_drain(&context->client) >= 0 &&
+        process_until(driver, context, FMA_MSG_OUTPUT_EOS);
+    pthread_mutex_unlock(&context->io_lock);
+    if (debug_enabled())
+        fprintf(stderr,
+                "fma-va: destroy context drain=%d duration_ms=%.3f "
+                "elapsed_ms=%.3f\n",
+                drained,
+                (double)(monotonic_ns() - started_ns) / 1000000.0,
+                driver_elapsed_ms(driver));
     close_context(context);
-    return VA_STATUS_SUCCESS;
+    return drained ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
 }
 
 static VAStatus create_buffer(VADriverContextP ctx, VAContextID context_id,
@@ -482,6 +870,8 @@ static VAStatus create_buffer(VADriverContextP ctx, VAContextID context_id,
         driver->buffers[i] = (struct va_buffer) {
             .used = true, .type = type, .size = size, .elements = elements,
             .data = data, .owns_data = true,
+            .derived_surface = VA_INVALID_ID,
+            .exported_fd = -1,
         };
         *id = i + 1;
         return VA_STATUS_SUCCESS;
@@ -494,30 +884,141 @@ static VAStatus buffer_set_elements(VADriverContextP ctx, VABufferID id,
     struct va_buffer *buffer = get_buffer(ctx->pDriverData, id);
     if (!buffer || !elements || elements > buffer->elements)
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
     buffer->elements = elements;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus map_buffer(VADriverContextP ctx, VABufferID id, void **data) {
-    struct va_buffer *buffer = get_buffer(ctx->pDriverData, id);
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_buffer *buffer = get_buffer(driver, id);
     if (!buffer || !data)
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    if (buffer->derived_surface != VA_INVALID_ID && !buffer->mapped) {
+        struct va_surface *surface =
+            get_surface(driver, buffer->derived_surface);
+        if (!surface || !begin_surface_cpu_access(surface, DMA_BUF_SYNC_RW))
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        buffer->mapped = true;
+        driver->surface_map_calls++;
+    }
     *data = buffer->data;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus unmap_buffer(VADriverContextP ctx, VABufferID id) {
-    return get_buffer(ctx->pDriverData, id) ? VA_STATUS_SUCCESS :
-                                             VA_STATUS_ERROR_INVALID_BUFFER;
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_buffer *buffer = get_buffer(driver, id);
+    if (!buffer)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    if (buffer->derived_surface != VA_INVALID_ID && buffer->mapped) {
+        struct va_surface *surface =
+            get_surface(driver, buffer->derived_surface);
+        if (!surface || !end_surface_cpu_access(surface, DMA_BUF_SYNC_RW))
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        buffer->mapped = false;
+    }
+    return VA_STATUS_SUCCESS;
 }
 
 static VAStatus destroy_buffer(VADriverContextP ctx, VABufferID id) {
     struct va_buffer *buffer = get_buffer(ctx->pDriverData, id);
     if (!buffer)
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    if (buffer->mapped && buffer->derived_surface != VA_INVALID_ID) {
+        struct va_surface *surface =
+            get_surface(ctx->pDriverData, buffer->derived_surface);
+        if (surface)
+            (void)end_surface_cpu_access(surface, DMA_BUF_SYNC_RW);
+    }
     if (buffer->owns_data)
         free(buffer->data);
     memset(buffer, 0, sizeof(*buffer));
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus acquire_buffer_handle(VADriverContextP ctx, VABufferID id,
+                                      VABufferInfo *info) {
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_buffer *buffer = get_buffer(driver, id);
+    if (!buffer)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!info)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (buffer->type != VAImageBufferType ||
+        buffer->derived_surface == VA_INVALID_ID)
+        return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+    if (buffer->acquired || buffer->mapped)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    if (info->mem_type &&
+        !(info->mem_type & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME))
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    struct va_surface *surface =
+        get_surface(driver, buffer->derived_surface);
+    if (!surface)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (surface->dma_buf_fd < 0)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    VAStatus status = sync_surface(ctx, buffer->derived_surface);
+    if (status != VA_STATUS_SUCCESS)
+        return status;
+    if (debug_enabled() &&
+        begin_surface_cpu_access(surface, DMA_BUF_SYNC_READ)) {
+        unsigned center_x = (surface->width / 2u) & ~1u;
+        unsigned center_y = surface->height / 2u;
+        unsigned center_uv_y = surface->height / 4u;
+        fprintf(stderr,
+                "fma-va: acquire surface=%u size=%ux%u stride=%u "
+                "uv_offset=%zu y0=%u yc=%u uv0=%u,%u uvc=%u,%u\n",
+                buffer->derived_surface, surface->width, surface->height,
+                surface->stride, surface->uv_offset, surface->data[0],
+                surface->data[(size_t)center_y * surface->stride + center_x],
+                surface->data[surface->uv_offset],
+                surface->data[surface->uv_offset + 1],
+                surface->data[surface->uv_offset +
+                              (size_t)center_uv_y * surface->stride +
+                              center_x],
+                surface->data[surface->uv_offset +
+                              (size_t)center_uv_y * surface->stride +
+                              center_x + 1]);
+        (void)end_surface_cpu_access(surface, DMA_BUF_SYNC_READ);
+    }
+    int exported_fd = fcntl(surface->dma_buf_fd, F_DUPFD_CLOEXEC, 0);
+    if (exported_fd < 0)
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    memset(info, 0, sizeof(*info));
+    info->handle = (uintptr_t)exported_fd;
+    info->type = buffer->type;
+    info->mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    info->mem_size = surface->size;
+    buffer->exported_fd = exported_fd;
+    buffer->acquired = true;
+    surface->external_handles++;
+    driver->acquire_handle_calls++;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus release_buffer_handle(VADriverContextP ctx, VABufferID id) {
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_buffer *buffer = get_buffer(driver, id);
+    if (!buffer)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!buffer->acquired || buffer->exported_fd < 0)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    close(buffer->exported_fd);
+    buffer->exported_fd = -1;
+    buffer->acquired = false;
+    struct va_surface *surface =
+        get_surface(driver, buffer->derived_surface);
+    if (surface && surface->external_handles)
+        surface->external_handles--;
     return VA_STATUS_SUCCESS;
 }
 
@@ -530,6 +1031,25 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!surface)
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (surface->external_handles)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    /*
+     * VA clients may release and recycle a decode surface before an
+     * asynchronous backend has emitted its previous frame. Preserve that
+     * submission's surface identity until its output has been collected;
+     * otherwise the new picture overwrites pts_us and the delayed frame can
+     * no longer be routed to its target.
+     */
+    if (surface->status != VASurfaceReady) {
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: waiting before surface reuse surface=%u "
+                    "pending_pts=%lld\n",
+                    target_id, (long long)surface->pts_us);
+        VAStatus status = sync_surface(ctx, target_id);
+        if (status != VA_STATUS_SUCCESS)
+            return status;
+    }
     context->target = target_id;
     context->slice_size = 0;
     context->have_picture = false;
@@ -612,19 +1132,40 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
     }
     surface->pts_us = pts_us;
     dump_packet(packet, packet_size);
-    int sent = fma_client_queue_packet(&context->client, packet, packet_size,
-                                       pts_us, 0);
+    uint64_t started_ns = monotonic_ns();
+    pthread_mutex_lock(&context->io_lock);
+    bool direct_output = context->direct_output && surface->dma_buf_fd >= 0 &&
+        surface->stride == context->pool.stride &&
+        surface->allocation_height == context->pool.height &&
+        surface->size >= context->pool.slot_size;
+    int sent = fma_client_queue_packet_to(
+        &context->client, packet, packet_size, pts_us, 0,
+        direct_output ? surface->dma_buf_fd : -1);
     free(packet);
-    if (sent < 0 || !process_until(driver, context, FMA_MSG_PACKET_ACK))
+    bool processed = sent >= 0 &&
+        process_until(driver, context, FMA_MSG_PACKET_ACK);
+    pthread_mutex_unlock(&context->io_lock);
+    driver->submitted_frames++;
+    driver->submission_ns += monotonic_ns() - started_ns;
+    if (!processed) {
+        if (debug_enabled())
+            fprintf(stderr, "fma-va: submission failed surface=%u pts=%lld "
+                            "sent=%d errno=%d\n",
+                    context->target, (long long)pts_us, sent, errno);
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
     if (debug_enabled())
-        fprintf(stderr, "fma-va: submitted surface=%u pts=%lld\n",
-                context->target, (long long)pts_us);
+        fprintf(stderr,
+                "fma-va: submitted surface=%u pts=%lld duration_ms=%.3f "
+                "elapsed_ms=%.3f\n",
+                context->target, (long long)pts_us,
+                (double)(monotonic_ns() - started_ns) / 1000000.0,
+                driver_elapsed_ms(driver));
     context->target = VA_INVALID_ID;
     return VA_STATUS_SUCCESS;
 }
 
-static VAStatus sync_surface(VADriverContextP ctx, VASurfaceID id) {
+static VAStatus sync_surface_internal(VADriverContextP ctx, VASurfaceID id) {
     struct va_driver *driver = ctx->pDriverData;
     struct va_surface *surface = get_surface(driver, id);
     if (!surface)
@@ -636,14 +1177,34 @@ static VAStatus sync_surface(VADriverContextP ctx, VASurfaceID id) {
             struct va_context *context = &driver->contexts[i];
             if (!context->used)
                 continue;
-            if (fma_client_poll_output(&context->client, 50) < 0 ||
-                !process_until(driver, context, FMA_MSG_POLL_DONE))
+            pthread_mutex_lock(&context->io_lock);
+            bool processed = surface->status == VASurfaceReady ||
+                (fma_client_poll_output(&context->client, 50) >= 0 &&
+                 process_until(driver, context, FMA_MSG_POLL_DONE));
+            pthread_mutex_unlock(&context->io_lock);
+            if (!processed)
                 return VA_STATUS_ERROR_OPERATION_FAILED;
             if (surface->status == VASurfaceReady)
                 return VA_STATUS_SUCCESS;
         }
     }
     return VA_STATUS_ERROR_TIMEDOUT;
+}
+
+static VAStatus sync_surface(VADriverContextP ctx, VASurfaceID id) {
+    uint64_t started_ns = monotonic_ns();
+    VAStatus status = sync_surface_internal(ctx, id);
+    struct va_driver *driver = ctx->pDriverData;
+    driver->sync_calls++;
+    driver->sync_ns += monotonic_ns() - started_ns;
+    if (debug_enabled())
+        fprintf(stderr,
+                "fma-va: sync surface=%u status=%d duration_ms=%.3f "
+                "elapsed_ms=%.3f\n",
+                id, status,
+                (double)(monotonic_ns() - started_ns) / 1000000.0,
+                driver_elapsed_ms(ctx->pDriverData));
+    return status;
 }
 
 static VAStatus query_surface_status(VADriverContextP ctx, VASurfaceID id,
@@ -660,15 +1221,15 @@ static VAStatus query_image_formats(VADriverContextP ctx,
     (void)ctx;
     if (!formats || !count)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    memset(&formats[0], 0, sizeof(formats[0]));
-    formats[0].fourcc = VA_FOURCC_NV12;
+    formats[0] = nv12_image_format();
     *count = 1;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus allocate_image(struct va_driver *driver, VAImageFormat *format,
-                               unsigned width, unsigned height, void *data,
-                               bool owns, VAImage *image) {
+                               unsigned width, unsigned height, unsigned pitch,
+                               unsigned storage_height, void *data, bool owns,
+                               VASurfaceID derived_surface, VAImage *image) {
     unsigned image_index = FMA_VA_MAX_IMAGES;
     unsigned buffer_index = FMA_VA_MAX_BUFFERS;
     for (unsigned i = 0; i < FMA_VA_MAX_IMAGES; ++i)
@@ -683,17 +1244,20 @@ static VAStatus allocate_image(struct va_driver *driver, VAImageFormat *format,
         }
     if (image_index == FMA_VA_MAX_IMAGES || buffer_index == FMA_VA_MAX_BUFFERS)
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-    if ((size_t)width > SIZE_MAX / height)
+    size_t y_size;
+    size_t bytes;
+    if (!nv12_layout(width, storage_height, pitch, &y_size, &bytes))
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    size_t y_size = (size_t)width * height;
-    size_t bytes = y_size + y_size / 2;
     driver->buffers[buffer_index] = (struct va_buffer) {
         .used = true, .type = VAImageBufferType, .size = (unsigned)bytes,
         .elements = 1, .data = data, .owns_data = owns,
+        .derived_surface = derived_surface,
+        .exported_fd = -1,
     };
     struct va_image *record = &driver->images[image_index];
     memset(record, 0, sizeof(*record));
     record->used = true;
+    record->derived_surface = derived_surface;
     record->image.image_id = image_index + 1;
     record->image.format = *format;
     record->image.buf = buffer_index + 1;
@@ -701,8 +1265,8 @@ static VAStatus allocate_image(struct va_driver *driver, VAImageFormat *format,
     record->image.height = height;
     record->image.data_size = (unsigned)bytes;
     record->image.num_planes = 2;
-    record->image.pitches[0] = width;
-    record->image.pitches[1] = width;
+    record->image.pitches[0] = pitch;
+    record->image.pitches[1] = pitch;
     record->image.offsets[0] = 0;
     record->image.offsets[1] = (unsigned)y_size;
     *image = record->image;
@@ -714,12 +1278,18 @@ static VAStatus create_image(VADriverContextP ctx, VAImageFormat *format,
     if (!format || format->fourcc != VA_FOURCC_NV12 || width <= 0 ||
         height <= 0 || !image)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    size_t bytes = (size_t)width * (size_t)height * 3u / 2u;
-    void *data = malloc(bytes);
+    unsigned pitch = ((unsigned)width + 1u) & ~1u;
+    size_t bytes;
+    if (!nv12_layout((unsigned)width, (unsigned)height, pitch, NULL,
+                     &bytes))
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    void *data = calloc(1, bytes);
     if (!data)
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     VAStatus status = allocate_image(ctx->pDriverData, format, (unsigned)width,
-                                     (unsigned)height, data, true, image);
+                                     (unsigned)height, pitch,
+                                     (unsigned)height, data, true,
+                                     VA_INVALID_ID, image);
     if (status != VA_STATUS_SUCCESS)
         free(data);
     return status;
@@ -727,6 +1297,7 @@ static VAStatus create_image(VADriverContextP ctx, VAImageFormat *format,
 
 static VAStatus derive_image(VADriverContextP ctx, VASurfaceID id,
                              VAImage *image) {
+    uint64_t started_ns = monotonic_ns();
     struct va_driver *driver = ctx->pDriverData;
     struct va_surface *surface = get_surface(driver, id);
     if (!surface || !image)
@@ -734,15 +1305,14 @@ static VAStatus derive_image(VADriverContextP ctx, VASurfaceID id,
     VAStatus status = sync_surface(ctx, id);
     if (status != VA_STATUS_SUCCESS)
         return status;
-    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
-    status = allocate_image(driver, &format, surface->stride, surface->height,
-                            surface->data, false, image);
-    if (status == VA_STATUS_SUCCESS) {
-        image->width = surface->width;
-        image->pitches[0] = surface->stride;
-        image->pitches[1] = surface->stride;
-        image->offsets[1] = surface->stride * surface->height;
-    }
+    VAImageFormat format = nv12_image_format();
+    status = allocate_image(driver, &format, surface->width, surface->height,
+                            surface->stride, surface->allocation_height,
+                            surface->data, false, id, image);
+    if (status == VA_STATUS_SUCCESS)
+        surface->derived_images++;
+    driver->derive_calls++;
+    driver->derive_ns += monotonic_ns() - started_ns;
     return status;
 }
 
@@ -753,9 +1323,23 @@ static VAStatus destroy_image(VADriverContextP ctx, VAImageID id) {
     struct va_image *image = &driver->images[id - 1];
     struct va_buffer *buffer = get_buffer(driver, image->image.buf);
     if (buffer) {
+        if (buffer->acquired)
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        if (buffer->mapped && image->derived_surface != VA_INVALID_ID) {
+            struct va_surface *surface =
+                get_surface(driver, image->derived_surface);
+            if (surface)
+                (void)end_surface_cpu_access(surface, DMA_BUF_SYNC_RW);
+        }
         if (buffer->owns_data)
             free(buffer->data);
         memset(buffer, 0, sizeof(*buffer));
+    }
+    if (image->derived_surface != VA_INVALID_ID) {
+        struct va_surface *surface =
+            get_surface(driver, image->derived_surface);
+        if (surface && surface->derived_images)
+            surface->derived_images--;
     }
     memset(image, 0, sizeof(*image));
     return VA_STATUS_SUCCESS;
@@ -764,9 +1348,12 @@ static VAStatus destroy_image(VADriverContextP ctx, VAImageID id) {
 static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
                           int x, int y, unsigned width, unsigned height,
                           VAImageID image_id) {
+    uint64_t started_ns = monotonic_ns();
     struct va_driver *driver = ctx->pDriverData;
     struct va_surface *surface = get_surface(driver, surface_id);
-    if (!surface || !image_id || image_id > FMA_VA_MAX_IMAGES ||
+    if (!surface)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!image_id || image_id > FMA_VA_MAX_IMAGES ||
         !driver->images[image_id - 1].used)
         return VA_STATUS_ERROR_INVALID_IMAGE;
     struct va_image *image = &driver->images[image_id - 1];
@@ -777,24 +1364,188 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
         (unsigned)y + height > surface->height ||
         width > image->image.width || height > image->image.height)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
     VAStatus status = sync_surface(ctx, surface_id);
     if (status != VA_STATUS_SUCCESS)
         return status;
+    struct va_surface *destination_surface =
+        image->derived_surface != VA_INVALID_ID ?
+            get_surface(driver, image->derived_surface) : NULL;
+    bool same_surface = destination_surface == surface;
+    if (!begin_surface_cpu_access(
+            surface, same_surface ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ))
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    if (destination_surface && !same_surface &&
+        !begin_surface_cpu_access(destination_surface, DMA_BUF_SYNC_WRITE)) {
+        (void)end_surface_cpu_access(surface, DMA_BUF_SYNC_READ);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
     uint8_t *destination = buffer->data;
-    for (unsigned row = 0; row < height; ++row)
-        memcpy(destination + image->image.offsets[0] +
-                   row * image->image.pitches[0],
-               surface->data + ((unsigned)y + row) * surface->stride +
-                   (unsigned)x,
-               width);
-    const uint8_t *source_uv =
-        surface->data + (size_t)surface->stride * surface->height;
-    for (unsigned row = 0; row < height / 2; ++row)
-        memcpy(destination + image->image.offsets[1] +
-                   row * image->image.pitches[1],
-               source_uv + ((unsigned)y / 2 + row) * surface->stride +
-                   (unsigned)x,
-               width);
+    bool identical_layout = x == 0 && y == 0 && width == surface->width &&
+        height == surface->height && image->image.width == width &&
+        image->image.height == height && image->image.offsets[0] == 0 &&
+        image->image.offsets[1] == surface->uv_offset &&
+        image->image.pitches[0] == surface->stride &&
+        image->image.pitches[1] == surface->stride &&
+        image->image.data_size >= surface->size;
+    if (identical_layout) {
+        memmove(destination, surface->data, surface->size);
+    } else {
+        for (unsigned row = 0; row < height; ++row)
+            memmove(destination + image->image.offsets[0] +
+                        row * image->image.pitches[0],
+                    surface->data + ((unsigned)y + row) * surface->stride +
+                        (unsigned)x,
+                    width);
+        const uint8_t *source_uv = surface->data + surface->uv_offset;
+        for (unsigned row = 0; row < height / 2; ++row)
+            memmove(destination + image->image.offsets[1] +
+                        row * image->image.pitches[1],
+                    source_uv + ((unsigned)y / 2 + row) * surface->stride +
+                        (unsigned)x,
+                    width);
+    }
+    bool synced = true;
+    if (destination_surface && !same_surface)
+        synced = end_surface_cpu_access(destination_surface,
+                                        DMA_BUF_SYNC_WRITE);
+    if (!end_surface_cpu_access(
+            surface, same_surface ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ))
+        synced = false;
+    driver->get_image_calls++;
+    driver->get_image_bytes += (uint64_t)width * height * 3u / 2u;
+    driver->get_image_ns += monotonic_ns() - started_ns;
+    return synced ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
+}
+
+static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
+                          VAImageID image_id, int src_x, int src_y,
+                          unsigned src_width, unsigned src_height, int dst_x,
+                          int dst_y, unsigned dst_width, unsigned dst_height) {
+    struct va_driver *driver = ctx->pDriverData;
+    struct va_surface *surface = get_surface(driver, surface_id);
+    if (!surface)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!image_id || image_id > FMA_VA_MAX_IMAGES ||
+        !driver->images[image_id - 1].used)
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    struct va_image *image = &driver->images[image_id - 1];
+    struct va_buffer *buffer = get_buffer(driver, image->image.buf);
+    if (!buffer || !buffer->data || image->image.format.fourcc != VA_FOURCC_NV12)
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    if (src_width != dst_width || src_height != dst_height)
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    if (src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0 ||
+        (src_x & 1) || (src_y & 1) || (dst_x & 1) || (dst_y & 1) ||
+        (src_width & 1) || (src_height & 1) ||
+        (unsigned)src_x + src_width > image->image.width ||
+        (unsigned)src_y + src_height > image->image.height ||
+        (unsigned)dst_x + dst_width > surface->width ||
+        (unsigned)dst_y + dst_height > surface->height)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    if (buffer->mapped || buffer->acquired)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    struct va_surface *source_surface =
+        image->derived_surface != VA_INVALID_ID ?
+            get_surface(driver, image->derived_surface) : NULL;
+    bool same_surface = source_surface == surface;
+    if (!begin_surface_cpu_access(
+            surface, same_surface ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_WRITE))
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    if (source_surface && !same_surface &&
+        !begin_surface_cpu_access(source_surface, DMA_BUF_SYNC_READ)) {
+        (void)end_surface_cpu_access(surface, DMA_BUF_SYNC_WRITE);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    const uint8_t *source = buffer->data;
+    for (unsigned row = 0; row < src_height; ++row)
+        memmove(surface->data + ((unsigned)dst_y + row) * surface->stride +
+                    (unsigned)dst_x,
+                source + image->image.offsets[0] +
+                    ((unsigned)src_y + row) * image->image.pitches[0] +
+                    (unsigned)src_x,
+                src_width);
+    uint8_t *destination_uv =
+        surface->data + surface->uv_offset;
+    for (unsigned row = 0; row < src_height / 2; ++row)
+        memmove(destination_uv +
+                    ((unsigned)dst_y / 2 + row) * surface->stride +
+                    (unsigned)dst_x,
+                source + image->image.offsets[1] +
+                    ((unsigned)src_y / 2 + row) * image->image.pitches[1] +
+                    (unsigned)src_x,
+                src_width);
+    bool synced = true;
+    if (source_surface && !same_surface)
+        synced = end_surface_cpu_access(source_surface, DMA_BUF_SYNC_READ);
+    if (!end_surface_cpu_access(
+            surface, same_surface ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_WRITE))
+        synced = false;
+    if (!synced)
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    surface->pts_us = -1;
+    surface->status = VASurfaceReady;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus export_surface_handle(VADriverContextP ctx,
+                                      VASurfaceID surface_id,
+                                      uint32_t memory_type, uint32_t flags,
+                                      void *descriptor) {
+    struct va_surface *surface = get_surface(ctx->pDriverData, surface_id);
+    if (!surface)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!descriptor)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (memory_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 ||
+        surface->dma_buf_fd < 0)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    uint32_t layer_flags =
+        flags & (VA_EXPORT_SURFACE_SEPARATE_LAYERS |
+                 VA_EXPORT_SURFACE_COMPOSED_LAYERS);
+    if (layer_flags == (VA_EXPORT_SURFACE_SEPARATE_LAYERS |
+                        VA_EXPORT_SURFACE_COMPOSED_LAYERS))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    int exported_fd = fcntl(surface->dma_buf_fd, F_DUPFD_CLOEXEC, 0);
+    if (exported_fd < 0)
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    VADRMPRIMESurfaceDescriptor *output = descriptor;
+    memset(output, 0, sizeof(*output));
+    output->fourcc = VA_FOURCC_NV12;
+    output->width = surface->width;
+    output->height = surface->height;
+    output->num_objects = 1;
+    output->objects[0].fd = exported_fd;
+    output->objects[0].size = (uint32_t)surface->size;
+    output->objects[0].drm_format_modifier = FMA_DRM_FORMAT_MOD_LINEAR;
+    uint32_t uv_offset = (uint32_t)surface->uv_offset;
+    if (layer_flags == VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+        output->num_layers = 2;
+        output->layers[0].drm_format = FMA_DRM_FORMAT_R8;
+        output->layers[0].num_planes = 1;
+        output->layers[0].object_index[0] = 0;
+        output->layers[0].offset[0] = 0;
+        output->layers[0].pitch[0] = surface->stride;
+        output->layers[1].drm_format = FMA_DRM_FORMAT_GR88;
+        output->layers[1].num_planes = 1;
+        output->layers[1].object_index[0] = 0;
+        output->layers[1].offset[0] = uv_offset;
+        output->layers[1].pitch[0] = surface->stride;
+    } else {
+        output->num_layers = 1;
+        output->layers[0].drm_format = FMA_DRM_FORMAT_NV12;
+        output->layers[0].num_planes = 2;
+        output->layers[0].object_index[0] = 0;
+        output->layers[0].object_index[1] = 0;
+        output->layers[0].offset[0] = 0;
+        output->layers[0].offset[1] = uv_offset;
+        output->layers[0].pitch[0] = surface->stride;
+        output->layers[0].pitch[1] = surface->stride;
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -811,7 +1562,7 @@ static void set_surface_attribute(VASurfaceAttrib *attribute,
 static VAStatus query_surface_attributes(VADriverContextP ctx, VAConfigID id,
                                          VASurfaceAttrib *attributes,
                                          unsigned *count) {
-    const unsigned required = 6;
+    const unsigned required = 7;
     if (!count || !get_config(ctx->pDriverData, id))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (!attributes) {
@@ -838,6 +1589,13 @@ static VAStatus query_surface_attributes(VADriverContextP ctx, VAConfigID id,
                           VA_SURFACE_ATTRIB_GETTABLE |
                               VA_SURFACE_ATTRIB_SETTABLE,
                           VA_SURFACE_ATTRIB_MEM_TYPE_VA);
+    set_surface_attribute(&attributes[6], VASurfaceAttribUsageHint,
+                          VA_SURFACE_ATTRIB_GETTABLE |
+                              VA_SURFACE_ATTRIB_SETTABLE,
+                          VA_SURFACE_ATTRIB_USAGE_HINT_DECODER |
+                              VA_SURFACE_ATTRIB_USAGE_HINT_DISPLAY |
+                              (dma_heap_available() ?
+                                   VA_SURFACE_ATTRIB_USAGE_HINT_EXPORT : 0));
     *count = required;
     return VA_STATUS_SUCCESS;
 }
@@ -864,10 +1622,6 @@ static VAStatus create_surfaces2(VADriverContextP ctx, unsigned format,
 
 UNIMPLEMENTED(set_image_palette,
               (VADriverContextP ctx, VAImageID image, unsigned char *palette))
-UNIMPLEMENTED(put_image,
-              (VADriverContextP ctx, VASurfaceID surface, VAImageID image,
-               int src_x, int src_y, unsigned src_width, unsigned src_height,
-               int dst_x, int dst_y, unsigned dst_width, unsigned dst_height))
 UNIMPLEMENTED(query_subpicture_formats,
               (VADriverContextP ctx, VAImageFormat *formats, unsigned *flags,
                unsigned *count))
@@ -908,6 +1662,7 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     struct va_driver *driver = calloc(1, sizeof(*driver));
     if (!driver)
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    driver->initialized_ns = monotonic_ns();
     for (unsigned i = 0; i < FMA_VA_MAX_CONTEXTS; ++i) {
         driver->contexts[i].client.socket_fd = -1;
         driver->contexts[i].pool_fd = -1;
@@ -938,6 +1693,8 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     ctx->vtable->vaMapBuffer = map_buffer;
     ctx->vtable->vaUnmapBuffer = unmap_buffer;
     ctx->vtable->vaDestroyBuffer = destroy_buffer;
+    ctx->vtable->vaAcquireBufferHandle = acquire_buffer_handle;
+    ctx->vtable->vaReleaseBufferHandle = release_buffer_handle;
     ctx->vtable->vaBeginPicture = begin_picture;
     ctx->vtable->vaRenderPicture = render_picture;
     ctx->vtable->vaEndPicture = end_picture;
@@ -963,5 +1720,6 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     ctx->vtable->vaSetDisplayAttributes = set_display_attributes;
     ctx->vtable->vaCreateSurfaces2 = create_surfaces2;
     ctx->vtable->vaQuerySurfaceAttributes = query_surface_attributes;
+    ctx->vtable->vaExportSurfaceHandle = export_surface_handle;
     return VA_STATUS_SUCCESS;
 }
