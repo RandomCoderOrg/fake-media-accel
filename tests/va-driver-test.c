@@ -5,6 +5,8 @@
 
 #include <va/va_backend.h>
 
+#include "h264_annexb.h"
+
 extern VAStatus __vaDriverInit_1_14(VADriverContextP context);
 
 #define CHECK(expression)                                                      \
@@ -49,6 +51,20 @@ int main(void) {
     picture.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 0;
     VASliceParameterBufferH264 slice = {0};
     const uint8_t slice_data[] = {0x65, 0xb8, 0x40};
+    static const uint8_t expected_packet[] = {
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x2a,
+        0xac, 0xe8, 0x42, 0x68, 0x06, 0xd0, 0x44, 0x23,
+        0x50, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38,
+        0x30, 0x00, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x40,
+    };
+    uint8_t *packet = NULL;
+    size_t packet_size = 0;
+    CHECK(fma_h264_build_packet(VAProfileH264High, &picture, &slice,
+                                slice_data, sizeof(slice_data), &packet,
+                                &packet_size));
+    CHECK(packet_size == sizeof(expected_packet));
+    CHECK(memcmp(packet, expected_packet, sizeof(expected_packet)) == 0);
+    free(packet);
 
     VABufferID buffers[3];
     CHECK(table.vaCreateBuffer(&context, decoder,

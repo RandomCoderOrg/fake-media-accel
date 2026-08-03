@@ -2,6 +2,7 @@
 
 #include "fma/client.h"
 #include "h264_annexb.h"
+#include "h264_timing.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -49,7 +50,7 @@ struct va_context {
     unsigned width;
     unsigned height;
     VASurfaceID target;
-    uint64_t submitted;
+    struct fma_h264_timeline timeline;
     struct fma_client client;
     struct fma_frame_pool pool;
     int pool_fd;
@@ -89,6 +90,22 @@ struct va_driver {
 static bool debug_enabled(void) {
     const char *value = getenv("FMA_VA_DEBUG");
     return value && *value && strcmp(value, "0") != 0;
+}
+
+static void dump_packet(const uint8_t *packet, size_t packet_size) {
+    const char *path = getenv("FMA_VA_DUMP");
+    if (!path || !*path)
+        return;
+    FILE *file = fopen(path, "ab");
+    if (!file) {
+        if (debug_enabled())
+            perror("fma-va: open packet dump");
+        return;
+    }
+    if (fwrite(packet, 1, packet_size, file) != packet_size && debug_enabled())
+        perror("fma-va: write packet dump");
+    if (fclose(file) != 0 && debug_enabled())
+        perror("fma-va: close packet dump");
 }
 
 static struct va_config *get_config(struct va_driver *driver, VAConfigID id) {
@@ -579,8 +596,22 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
         free(packet);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
-    int64_t pts_us = (int64_t)(++context->submitted * 1000);
+    unsigned nal_type = context->slice_size ? context->slices[0] & 0x1fu : 0;
+    int64_t pts_us = fma_h264_picture_pts(
+        &context->timeline, context->picture.CurrPic.TopFieldOrderCnt,
+        nal_type == 5);
+    if (debug_enabled()) {
+        fprintf(stderr,
+                "fma-va: picture surface=%u frame_num=%u top_poc=%d "
+                "bottom_poc=%d slice_type=%u nal_type=%u pts=%lld\n",
+                context->target, context->picture.frame_num,
+                context->picture.CurrPic.TopFieldOrderCnt,
+                context->picture.CurrPic.BottomFieldOrderCnt,
+                context->first_slice.slice_type, nal_type,
+                (long long)pts_us);
+    }
     surface->pts_us = pts_us;
+    dump_packet(packet, packet_size);
     int sent = fma_client_queue_packet(&context->client, packet, packet_size,
                                        pts_us, 0);
     free(packet);

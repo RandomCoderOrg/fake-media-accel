@@ -215,7 +215,32 @@ bool fma_h264_build_packet(VAProfile profile,
                 picture->seq_fields.bits.mb_adaptive_frame_field_flag);
     put_bit(&sps, picture->seq_fields.bits.direct_8x8_inference_flag);
     put_bit(&sps, 0);
-    put_bit(&sps, 0);
+    /*
+     * libva does not expose the source VUI.  Supplying no bitstream
+     * restriction lets a decoder derive a reorder window from level_idc;
+     * that can be larger than the VA surface pool and deadlock B-frame
+     * streams.  The VA caller already owns presentation order through its
+     * surfaces, so request decode-order output from MediaCodec and use POC
+     * timestamps to map each returned image back to the correct surface.
+     */
+    unsigned buffering = picture->num_ref_frames ? picture->num_ref_frames : 1;
+    put_bit(&sps, 1);  /* vui_parameters_present_flag */
+    put_bit(&sps, 0);  /* aspect_ratio_info_present_flag */
+    put_bit(&sps, 0);  /* overscan_info_present_flag */
+    put_bit(&sps, 0);  /* video_signal_type_present_flag */
+    put_bit(&sps, 0);  /* chroma_loc_info_present_flag */
+    put_bit(&sps, 0);  /* timing_info_present_flag */
+    put_bit(&sps, 0);  /* nal_hrd_parameters_present_flag */
+    put_bit(&sps, 0);  /* vcl_hrd_parameters_present_flag */
+    put_bit(&sps, 0);  /* pic_struct_present_flag */
+    put_bit(&sps, 1);  /* bitstream_restriction_flag */
+    put_bit(&sps, 1);  /* motion_vectors_over_pic_boundaries_flag */
+    put_ue(&sps, 2);   /* max_bytes_per_pic_denom */
+    put_ue(&sps, 1);   /* max_bits_per_mb_denom */
+    put_ue(&sps, 16);  /* log2_max_mv_length_horizontal */
+    put_ue(&sps, 16);  /* log2_max_mv_length_vertical */
+    put_ue(&sps, 0);          /* max_num_reorder_frames */
+    put_ue(&sps, buffering);  /* max_dec_frame_buffering */
     size_t sps_size = finish_rbsp(&sps);
     if (!sps_size || !append_nal(packet, packet_size, &capacity, 0x67,
                                  sps.data, sps_size))

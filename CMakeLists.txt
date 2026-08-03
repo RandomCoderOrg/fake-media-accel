@@ -38,6 +38,7 @@ else()
         add_library(fma-va-driver SHARED
             src/va/fma_drv_video.c
             src/va/h264_annexb.c
+            src/va/h264_timing.c
         )
         target_include_directories(fma-va-driver PRIVATE include src/va)
         target_link_libraries(fma-va-driver PRIVATE fma-client PkgConfig::LIBVA)
@@ -51,6 +52,12 @@ else()
         target_link_libraries(fma-va-driver-test PRIVATE
             fma-va-driver PkgConfig::LIBVA
         )
+        target_include_directories(fma-va-driver-test PRIVATE src/va)
+        add_executable(fma-h264-timing-test
+            tests/h264-timing-test.c
+            src/va/h264_timing.c
+        )
+        target_include_directories(fma-h264-timing-test PRIVATE src/va)
     endif()
 
     include(CTest)
@@ -66,6 +73,7 @@ else()
                 ${CMAKE_SOURCE_DIR}/LICENSE
                 ${CMAKE_BINARY_DIR}/fake-roundtrip.nv12)
         if(LIBVA_FOUND)
+            add_test(NAME h264-timing COMMAND fma-h264-timing-test)
             add_test(NAME va-roundtrip
                 COMMAND sh ${CMAKE_SOURCE_DIR}/tests/va-roundtrip.sh
                     $<TARGET_FILE:fake-media-acceld>
