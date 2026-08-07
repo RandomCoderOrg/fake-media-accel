@@ -24,6 +24,9 @@ descriptor.
 ## Current contract
 
 - H.264 constrained-baseline, main and high profile decode.
+- Exact VA reconstruction for representable 8-bit 4:2:0 streams. POC type 1
+  requires the packet-preserving path because the standard VA picture buffer
+  omits its SPS offset arrays; the driver rejects it instead of guessing.
 - NV12 `vaCreateImage`, `vaDeriveImage`, `vaGetImage` and unscaled
   `vaPutImage`.
 - DMA-BUF cache synchronization around CPU access.
@@ -67,6 +70,9 @@ standard path; it is not a VLC-specific integration.
 `FMA_VA_DEBUG=1` exposes protocol message flow plus context creation, packet
 submission, surface synchronization and drain durations. It is intended for
 short controlled probes, not normal playback.
+
+The codec-level corpus, exact-output results and the boundary between the VA
+and packet-preserving paths are documented in [the H.264 checkpoint](h264.md).
 
 ## Cost measured on the current 1080p30 sample
 
