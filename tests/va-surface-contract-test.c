@@ -53,14 +53,17 @@ int main(void) {
     struct VADriverContext context = {.vtable = &table};
     CHECK(__vaDriverInit_1_14(&context) == VA_STATUS_SUCCESS);
 
-    VAImageFormat formats[1];
+    VAImageFormat formats[2];
     int format_count = 0;
     CHECK(table.vaQueryImageFormats(&context, formats, &format_count) ==
           VA_STATUS_SUCCESS);
-    CHECK(format_count == 1);
+    CHECK(format_count == 2);
     CHECK(formats[0].fourcc == VA_FOURCC_NV12);
     CHECK(formats[0].byte_order == VA_LSB_FIRST);
     CHECK(formats[0].bits_per_pixel == 12);
+    CHECK(formats[1].fourcc == VA_FOURCC_I420);
+    CHECK(formats[1].byte_order == VA_LSB_FIRST);
+    CHECK(formats[1].bits_per_pixel == 12);
 
     VAConfigID config;
     CHECK(table.vaCreateConfig(&context, VAProfileH264High, VAEntrypointVLD,
@@ -196,6 +199,68 @@ int main(void) {
           chroma_value(18, 13));
     CHECK(table.vaUnmapBuffer(&context, download.buf) == VA_STATUS_SUCCESS);
 
+    VAImage planar_download;
+    CHECK(table.vaCreateImage(&context, &formats[1], 32, 32,
+                              &planar_download) == VA_STATUS_SUCCESS);
+    CHECK(planar_download.num_planes == 3);
+    CHECK(planar_download.pitches[0] == 32);
+    CHECK(planar_download.pitches[1] == 16);
+    CHECK(planar_download.pitches[2] == 16);
+    CHECK(table.vaGetImage(&context, surface, 16, 16, 32, 32,
+                           planar_download.image_id) == VA_STATUS_SUCCESS);
+    uint8_t *planar_pixels = NULL;
+    CHECK(table.vaMapBuffer(&context, planar_download.buf,
+                            (void **)&planar_pixels) == VA_STATUS_SUCCESS);
+    CHECK(planar_pixels[planar_download.offsets[0] +
+                        7 * planar_download.pitches[0] + 3] ==
+          luma_value(19, 23));
+    CHECK(planar_pixels[planar_download.offsets[1] +
+                        5 * planar_download.pitches[1] + 1] ==
+          chroma_value(18, 13));
+    CHECK(planar_pixels[planar_download.offsets[2] +
+                        5 * planar_download.pitches[2] + 1] ==
+          chroma_value(19, 13));
+    CHECK(table.vaUnmapBuffer(&context, planar_download.buf) ==
+          VA_STATUS_SUCCESS);
+
+    VAImage planar_upload;
+    CHECK(table.vaCreateImage(&context, &formats[1], 32, 32,
+                              &planar_upload) == VA_STATUS_SUCCESS);
+    CHECK(table.vaMapBuffer(&context, planar_upload.buf,
+                            (void **)&planar_pixels) == VA_STATUS_SUCCESS);
+    for (unsigned row = 0; row < 16; ++row)
+        for (unsigned column = 0; column < 16; ++column) {
+            planar_pixels[planar_upload.offsets[1] +
+                          row * planar_upload.pitches[1] + column] =
+                (uint8_t)(41u + row + column);
+            planar_pixels[planar_upload.offsets[2] +
+                          row * planar_upload.pitches[2] + column] =
+                (uint8_t)(131u + row + column);
+        }
+    CHECK(table.vaUnmapBuffer(&context, planar_upload.buf) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaPutImage(&context, surface, planar_upload.image_id,
+                           0, 0, 32, 32, 0, 0, 32, 32) == VA_STATUS_SUCCESS);
+    VAImage planar_check;
+    CHECK(table.vaCreateImage(&context, &formats[0], 32, 32, &planar_check) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaGetImage(&context, surface, 0, 0, 32, 32,
+                           planar_check.image_id) == VA_STATUS_SUCCESS);
+    uint8_t *planar_check_pixels = NULL;
+    CHECK(table.vaMapBuffer(&context, planar_check.buf,
+                            (void **)&planar_check_pixels) == VA_STATUS_SUCCESS);
+    CHECK(planar_check_pixels[planar_check.offsets[1] +
+                              5 * planar_check.pitches[1] + 6] == 49);
+    CHECK(planar_check_pixels[planar_check.offsets[1] +
+                              5 * planar_check.pitches[1] + 7] == 139);
+    CHECK(table.vaUnmapBuffer(&context, planar_check.buf) == VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyImage(&context, planar_check.image_id) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyImage(&context, planar_upload.image_id) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaPutImage(&context, surface, upload.image_id, 0, 0, 64, 64,
+                           0, 0, 64, 64) == VA_STATUS_SUCCESS);
+
     VADRMPRIMESurfaceDescriptor descriptor;
     CHECK(table.vaExportSurfaceHandle != NULL);
     VAStatus export_status = table.vaExportSurfaceHandle(
@@ -272,6 +337,8 @@ int main(void) {
           VA_STATUS_SUCCESS);
 
     CHECK(table.vaDestroyImage(&context, download.image_id) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyImage(&context, planar_download.image_id) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyImage(&context, derived.image_id) ==
           VA_STATUS_SUCCESS);

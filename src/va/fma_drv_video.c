@@ -253,6 +253,15 @@ static VAImageFormat nv12_image_format(void) {
     return format;
 }
 
+static VAImageFormat i420_image_format(void) {
+    VAImageFormat format;
+    memset(&format, 0, sizeof(format));
+    format.fourcc = VA_FOURCC_I420;
+    format.byte_order = VA_LSB_FIRST;
+    format.bits_per_pixel = 12;
+    return format;
+}
+
 static bool nv12_layout(unsigned width, unsigned height, unsigned pitch,
                         size_t *y_size, size_t *bytes) {
     if (!width || !height || pitch < width || (pitch & 1u) ||
@@ -1513,7 +1522,8 @@ static VAStatus query_image_formats(VADriverContextP ctx,
     if (!formats || !count)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     formats[0] = nv12_image_format();
-    *count = 1;
+    formats[1] = i420_image_format();
+    *count = 2;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1536,9 +1546,29 @@ static VAStatus allocate_image(struct va_driver *driver, VAImageFormat *format,
     if (image_index == FMA_VA_MAX_IMAGES || buffer_index == FMA_VA_MAX_BUFFERS)
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     size_t y_size;
+    size_t chroma_size = 0;
     size_t bytes;
-    if (!nv12_layout(width, storage_height, pitch, &y_size, &bytes))
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    unsigned chroma_pitch = pitch;
+    if (format->fourcc == VA_FOURCC_NV12) {
+        if (!nv12_layout(width, storage_height, pitch, &y_size, &bytes))
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    } else if (format->fourcc == VA_FOURCC_I420) {
+        if (!width || !storage_height || pitch < width || (pitch & 1u) ||
+            (size_t)pitch > SIZE_MAX / storage_height)
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        y_size = (size_t)pitch * storage_height;
+        chroma_pitch = pitch / 2u;
+        unsigned chroma_rows = (storage_height + 1u) / 2u;
+        if ((size_t)chroma_pitch > SIZE_MAX / chroma_rows)
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        chroma_size = (size_t)chroma_pitch * chroma_rows;
+        if (chroma_size > (SIZE_MAX - y_size) / 2u ||
+            y_size + chroma_size * 2u > UINT_MAX)
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        bytes = y_size + chroma_size * 2u;
+    } else {
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
     driver->buffers[buffer_index] = (struct va_buffer) {
         .used = true, .type = VAImageBufferType, .size = (unsigned)bytes,
         .elements = 1, .data = data, .owns_data = owns,
@@ -1555,19 +1585,23 @@ static VAStatus allocate_image(struct va_driver *driver, VAImageFormat *format,
     record->image.width = width;
     record->image.height = height;
     record->image.data_size = (unsigned)bytes;
-    record->image.num_planes = 2;
+    record->image.num_planes = format->fourcc == VA_FOURCC_I420 ? 3 : 2;
     record->image.pitches[0] = pitch;
-    record->image.pitches[1] = pitch;
+    record->image.pitches[1] = chroma_pitch;
+    record->image.pitches[2] = chroma_pitch;
     record->image.offsets[0] = 0;
     record->image.offsets[1] = (unsigned)y_size;
+    record->image.offsets[2] = (unsigned)(y_size + chroma_size);
     *image = record->image;
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus create_image(VADriverContextP ctx, VAImageFormat *format,
                              int width, int height, VAImage *image) {
-    if (!format || format->fourcc != VA_FOURCC_NV12 || width <= 0 ||
-        height <= 0 || !image)
+    if (!format ||
+        (format->fourcc != VA_FOURCC_NV12 &&
+         format->fourcc != VA_FOURCC_I420) ||
+        width <= 0 || height <= 0 || !image)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     unsigned pitch = ((unsigned)width + 1u) & ~1u;
     size_t bytes;
@@ -1649,7 +1683,10 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_INVALID_IMAGE;
     struct va_image *image = &driver->images[image_id - 1];
     struct va_buffer *buffer = get_buffer(driver, image->image.buf);
-    if (!buffer || !buffer->data || x < 0 || y < 0 || (x & 1) || (y & 1) ||
+    bool planar = image->image.format.fourcc == VA_FOURCC_I420;
+    if (!buffer || !buffer->data ||
+        (!planar && image->image.format.fourcc != VA_FOURCC_NV12) ||
+        x < 0 || y < 0 || (x & 1) || (y & 1) ||
         (width & 1) || (height & 1) ||
         (unsigned)x + width > surface->width ||
         (unsigned)y + height > surface->height ||
@@ -1673,7 +1710,8 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     uint8_t *destination = buffer->data;
-    bool identical_layout = x == 0 && y == 0 && width == surface->width &&
+    bool identical_layout = !planar &&
+        x == 0 && y == 0 && width == surface->width &&
         height == surface->height && image->image.width == width &&
         image->image.height == height && image->image.offsets[0] == 0 &&
         image->image.offsets[1] == surface->uv_offset &&
@@ -1690,12 +1728,24 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
                         (unsigned)x,
                     width);
         const uint8_t *source_uv = surface->data + surface->uv_offset;
-        for (unsigned row = 0; row < height / 2; ++row)
-            memmove(destination + image->image.offsets[1] +
-                        row * image->image.pitches[1],
-                    source_uv + ((unsigned)y / 2 + row) * surface->stride +
-                        (unsigned)x,
-                    width);
+        for (unsigned row = 0; row < height / 2; ++row) {
+            const uint8_t *source_row = source_uv +
+                ((unsigned)y / 2 + row) * surface->stride + (unsigned)x;
+            if (!planar) {
+                memmove(destination + image->image.offsets[1] +
+                            row * image->image.pitches[1],
+                        source_row, width);
+                continue;
+            }
+            uint8_t *destination_u = destination + image->image.offsets[1] +
+                row * image->image.pitches[1];
+            uint8_t *destination_v = destination + image->image.offsets[2] +
+                row * image->image.pitches[2];
+            for (unsigned column = 0; column < width / 2; ++column) {
+                destination_u[column] = source_row[column * 2u];
+                destination_v[column] = source_row[column * 2u + 1u];
+            }
+        }
     }
     bool synced = true;
     if (destination_surface && !same_surface)
@@ -1723,7 +1773,9 @@ static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_INVALID_IMAGE;
     struct va_image *image = &driver->images[image_id - 1];
     struct va_buffer *buffer = get_buffer(driver, image->image.buf);
-    if (!buffer || !buffer->data || image->image.format.fourcc != VA_FOURCC_NV12)
+    bool planar = image->image.format.fourcc == VA_FOURCC_I420;
+    if (!buffer || !buffer->data ||
+        (!planar && image->image.format.fourcc != VA_FOURCC_NV12))
         return VA_STATUS_ERROR_INVALID_IMAGE;
     if (src_width != dst_width || src_height != dst_height)
         return VA_STATUS_ERROR_UNIMPLEMENTED;
@@ -1761,14 +1813,25 @@ static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
                 src_width);
     uint8_t *destination_uv =
         surface->data + surface->uv_offset;
-    for (unsigned row = 0; row < src_height / 2; ++row)
-        memmove(destination_uv +
-                    ((unsigned)dst_y / 2 + row) * surface->stride +
-                    (unsigned)dst_x,
-                source + image->image.offsets[1] +
-                    ((unsigned)src_y / 2 + row) * image->image.pitches[1] +
-                    (unsigned)src_x,
-                src_width);
+    for (unsigned row = 0; row < src_height / 2; ++row) {
+        uint8_t *destination_row = destination_uv +
+            ((unsigned)dst_y / 2 + row) * surface->stride +
+            (unsigned)dst_x;
+        const uint8_t *source_u = source + image->image.offsets[1] +
+            ((unsigned)src_y / 2 + row) * image->image.pitches[1] +
+            (planar ? (unsigned)src_x / 2u : (unsigned)src_x);
+        if (!planar) {
+            memmove(destination_row, source_u, src_width);
+            continue;
+        }
+        const uint8_t *source_v = source + image->image.offsets[2] +
+            ((unsigned)src_y / 2 + row) * image->image.pitches[2] +
+            (unsigned)src_x / 2u;
+        for (unsigned column = 0; column < src_width / 2; ++column) {
+            destination_row[column * 2u] = source_u[column];
+            destination_row[column * 2u + 1u] = source_v[column];
+        }
+    }
     bool synced = true;
     if (source_surface && !same_surface)
         synced = end_surface_cpu_access(source_surface, DMA_BUF_SYNC_READ);
@@ -1964,7 +2027,7 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     ctx->max_profiles = 5;
     ctx->max_entrypoints = 1;
     ctx->max_attributes = 1;
-    ctx->max_image_formats = 1;
+    ctx->max_image_formats = 2;
     ctx->max_subpic_formats = 1;
     ctx->max_display_attributes = 1;
     ctx->str_vendor = "fake-media-accel MediaCodec VA-API bridge";
