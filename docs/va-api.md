@@ -1,6 +1,7 @@
 # VA-API bridge status
 
-FMA exposes H.264 MediaCodec decoding through an ordinary VA-API driver. On
+FMA exposes H.264 and VP9 Profile 0 MediaCodec decoding through an ordinary
+VA-API driver. On
 Android systems where `/dev/dma_heap/system` is accessible, decoded NV12
 surfaces are backed by linear DMA-BUFs and can be exported with
 `vaExportSurfaceHandle()` as `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`.
@@ -24,6 +25,9 @@ descriptor.
 ## Current contract
 
 - H.264 constrained-baseline, main and high profile decode.
+- VP9 Profile 0, 8-bit 4:2:0 decode. The complete compressed VP9 frame supplied
+  by libva is forwarded unchanged; Profile 2 is rejected because the current
+  decoded-frame contract is NV12.
 - Exact VA reconstruction for representable 8-bit 4:2:0 streams. POC type 1
   requires the packet-preserving path because the standard VA picture buffer
   omits its SPS offset arrays; the driver rejects it instead of guessing.
@@ -71,8 +75,8 @@ standard path; it is not a VLC-specific integration.
 submission, surface synchronization and drain durations. It is intended for
 short controlled probes, not normal playback.
 
-The codec-level corpus, exact-output results and the boundary between the VA
-and packet-preserving paths are documented in [the H.264 checkpoint](h264.md).
+Codec-level corpora, exact-output results and VA boundaries are documented in
+the [H.264 checkpoint](h264.md) and [VP9 checkpoint](vp9.md).
 
 ## Cost measured on the current 1080p30 sample
 
