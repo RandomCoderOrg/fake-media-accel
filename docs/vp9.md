@@ -21,7 +21,8 @@ The VP9 codec checkpoint covers:
 - IVF framing and timestamp conversion;
 - quantizer extremes, resizing, show-existing-frame and intra-only behavior;
 - superframes, segmentation and 1080p tiling;
-- compressed frames larger than one MediaCodec input buffer;
+- explicit rejection when a compressed frame exceeds one MediaCodec input
+  buffer, avoiding partial output or silent frame loss;
 - drain, flush and repeated decode cycles;
 - exact visible-frame agreement with FFmpeg software decode;
 - output-format changes with visible crop metadata;
@@ -62,10 +63,14 @@ padding boundary created by the odd 173-line visible height; the aggregate
 comparison is 53.32 dB PSNR. This is a layout-boundary difference, not a scaled
 or corrupted decode.
 
-A forced 16 KiB MediaCodec input limit split a 147,804-byte, two-packet sample
-across three input buffers and retained its reference MD5. Three consecutive
-decode/flush cycles of the show-existing sample produced 39 of 39 frames, and
-all three output cycles had the same MD5:
+A forced 16 KiB MediaCodec input limit correctly rejects the 147,804-byte,
+two-packet quantizer sample before submitting an incomplete VP9 frame. Android's
+VP9 decoder does not accept MediaCodec partial-frame input reliably; the normal
+component buffer is large enough for the conformance corpus, while an oversized
+frame now fails explicitly instead of silently producing one of two frames.
+
+Three consecutive decode/flush cycles of the show-existing sample produced 39
+of 39 frames, and all three output cycles had the same MD5:
 
 ```text
 950623aecd12f04541c7b6155d53d591
