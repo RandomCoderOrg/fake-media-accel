@@ -99,10 +99,66 @@ All 358 VP9 surfaces in every hardware run were direct and exact. Median total
 CPU fell by about 61 percent. Median VA context creation took 85 ms and drain
 plus destruction took 15 ms, ruling out lifecycle setup as a pacing bottleneck.
 
+## AV1 FFplay checkpoint
+
+FFplay at FFmpeg commit `5c395992f99feb47860e4cc99a0cea2009457870`
+was built with both patches from [`patches/ffmpeg`](../patches/ffmpeg). The
+packet-preserving adapter supplies complete AV1 temporal units to FMA, while
+the FFplay patch permits explicit VA-API decode with filtered SDL output when
+FFplay's Vulkan renderer is unavailable.
+
+Use the same counterbalanced process accounting as the VLC probe:
+
+```bash
+FMA_FFPLAY=/path/to/patched/ffplay \
+FMA_SOFTWARE_FFPLAY=/usr/bin/ffplay \
+FMA_DAEMON_PID="$(pgrep -f '/fake-media-acceld ' | head -n 1)" \
+FMA_APP_USER=linux-user \
+FMA_RUNS=3 \
+tools/fma-ffplay-benchmark.sh video.ivf both
+```
+
+The real-world smoke is a Main-profile, 8-bit AV1 transcode of the same local
+Gravity segment used by the H.264 and VP9 checkpoints. It contains 360 frames,
+lasts 15.015 seconds, has file MD5
+`61fb98b6a86d948e8d9b15dfc81a5192`, and preserves the 2048 x 858 visible
+size. Hardware and software decoding produced exactly the same 948,879,360
+visible NV12 bytes.
+
+The following hot-device checkpoint started at Android thermal status 2 and
+ended at status 3. Values are medians from three counterbalanced runs, so they
+measure the current implementation under sustained pressure rather than a
+cold-device peak:
+
+| Measurement | FMA hardware | Software |
+| --- | ---: | ---: |
+| Wall time | 16.119 s | 16.881 s |
+| FFplay and presentation CPU | 5.158 s | 15.001 s |
+| Android daemon CPU | 5.330 s | 0 s |
+| Total measured CPU | **10.488 s** | **15.001 s** |
+| Peak application RSS | 60.8 MiB | 135.5 MiB |
+| FFplay presentation drops | 6 | 1 |
+
+```mermaid
+xychart-beta
+    title "AV1 FFplay median CPU seconds"
+    x-axis ["FMA app", "FMA daemon", "FMA total", "Software total"]
+    y-axis "CPU seconds" 0 --> 16
+    bar [5.158, 5.330, 10.488, 15.001]
+```
+
+All 360 decoded outputs were stored directly in DMA-BUF-backed surfaces, with
+no decoded-frame data crossing the Unix socket and no daemon-side storage
+copy. FFplay currently downloads about 895 MiB of planar image data per run for
+SDL presentation. That compatibility copy took under 0.52 seconds in the VA
+driver, but its subsequent upload and display remain outside FMA. The selected
+SDL/OpenGL renderer is therefore part of the application environment, not a
+Mali or Panfork dependency of FMA.
+
 ## Remaining application work
 
-- Connect the packet-preserving AV1 FFmpeg adapter to applications that embed
-  libavcodec; VLC 3.0's bundled decoder does not provide FMA's AV1 packet
+- Connect the packet-preserving AV1 adapter to additional applications that
+  embed libavcodec. VLC 3.0's bundled decoder does not provide FMA's AV1 packet
   contract.
 - Add browser/RDD-sandbox socket and DMA-heap access without weakening unrelated
   browser sandboxes.
