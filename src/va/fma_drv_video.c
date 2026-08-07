@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "fma/client.h"
+#include "fma/va_private.h"
 #include "h264_annexb.h"
 #include "h264_timing.h"
 
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_av1.h>
 #include <va/va_dec_vp9.h>
 #include <va/va_drmcommon.h>
 
@@ -130,6 +132,9 @@ struct va_context {
     VADecPictureParameterBufferVP9 vp9_picture;
     VASliceParameterBufferVP9 vp9_slice;
     bool have_vp9_slice;
+    VADecPictureParameterBufferAV1 av1_picture;
+    bool have_av1_packet;
+    uint32_t av1_packet_flags;
 };
 
 struct va_buffer {
@@ -346,6 +351,8 @@ static uint32_t codec_for_profile(VAProfile profile) {
         return FMA_CODEC_H264;
     if (profile == VAProfileVP9Profile0)
         return FMA_CODEC_VP9;
+    if (profile == VAProfileAV1Profile0)
+        return FMA_CODEC_AV1;
     return 0;
 }
 
@@ -605,7 +612,8 @@ static VAStatus query_profiles(VADriverContextP ctx, VAProfile *profiles,
     profiles[1] = VAProfileH264Main;
     profiles[2] = VAProfileH264High;
     profiles[3] = VAProfileVP9Profile0;
-    *count = 4;
+    profiles[4] = VAProfileAV1Profile0;
+    *count = 5;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1083,6 +1091,8 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
     context->have_first_slice = false;
     context->have_iq_matrix = false;
     context->have_vp9_slice = false;
+    context->have_av1_packet = false;
+    context->av1_packet_flags = 0;
     context->slice_fragment_open = false;
     surface->pts_us = -1;
     surface->status = VASurfaceRendering;
@@ -1136,6 +1146,40 @@ static VAStatus render_vp9_buffer(struct va_context *context,
     return VA_STATUS_SUCCESS;
 }
 
+static VAStatus render_av1_buffer(struct va_context *context,
+                                  const struct va_buffer *buffer) {
+    size_t bytes = (size_t)buffer->size * buffer->elements;
+    if (buffer->type == VAPictureParameterBufferType) {
+        if (buffer->elements != 1 || bytes < sizeof(context->av1_picture))
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        memcpy(&context->av1_picture, buffer->data,
+               sizeof(context->av1_picture));
+        context->have_picture = true;
+        return VA_STATUS_SUCCESS;
+    }
+    if ((unsigned)buffer->type != FMA_VA_PACKET_BUFFER_TYPE)
+        return VA_STATUS_SUCCESS;
+    if (buffer->elements != 1 || bytes < sizeof(struct fma_va_packet_header) ||
+        context->have_av1_packet)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    const struct fma_va_packet_header *header = buffer->data;
+    if (header->magic != FMA_VA_PACKET_MAGIC ||
+        header->version != FMA_VA_PACKET_VERSION ||
+        header->codec != FMA_CODEC_AV1 ||
+        (header->flags & ~FMA_VA_PACKET_FLAG_AV1_SHOW_EXISTING) ||
+        header->payload_size != bytes - sizeof(*header) ||
+        !header->payload_size || header->payload_size > FMA_MAX_PAYLOAD)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!append_data(&context->slices, &context->slice_size,
+                     &context->slice_capacity, header + 1,
+                     header->payload_size))
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    context->have_av1_packet = true;
+    context->av1_packet_flags = header->flags;
+    context->have_first_slice = true;
+    return VA_STATUS_SUCCESS;
+}
+
 static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
                                VABufferID *ids, int count) {
     struct va_driver *driver = ctx->pDriverData;
@@ -1155,6 +1199,12 @@ static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
             return VA_STATUS_ERROR_INVALID_BUFFER;
         if (codec == FMA_CODEC_VP9) {
             VAStatus status = render_vp9_buffer(context, buffer);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+            continue;
+        }
+        if (codec == FMA_CODEC_AV1) {
+            VAStatus status = render_av1_buffer(context, buffer);
             if (status != VA_STATUS_SUCCESS)
                 return status;
             continue;
@@ -1239,11 +1289,15 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     struct va_surface *surface = get_surface(driver, context->target);
     struct va_config *config = get_config(driver, context->config_id);
-    if (!surface || !config || !context->have_picture ||
-        !context->have_first_slice || context->pending_slice_count ||
-        context->slice_fragment_open)
+    if (!surface || !config || !context->have_first_slice ||
+        context->pending_slice_count || context->slice_fragment_open)
         return VA_STATUS_ERROR_DECODING_ERROR;
     uint32_t codec = codec_for_profile(config->profile);
+    bool av1_show_existing = codec == FMA_CODEC_AV1 &&
+        (context->av1_packet_flags &
+         FMA_VA_PACKET_FLAG_AV1_SHOW_EXISTING);
+    if (!context->have_picture && !av1_show_existing)
+        return VA_STATUS_ERROR_DECODING_ERROR;
     uint8_t *owned_packet = NULL;
     const uint8_t *packet = NULL;
     size_t packet_size = 0;
@@ -1306,6 +1360,42 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
                     context->vp9_picture.frame_height,
                     context->vp9_picture.profile,
                     context->vp9_picture.bit_depth, expects_output,
+                    (long long)pts_us);
+    } else if (codec == FMA_CODEC_AV1) {
+        if (!context->have_av1_packet ||
+            (!av1_show_existing && (context->av1_picture.profile != 0 ||
+            context->av1_picture.bit_depth_idx != 0 ||
+            !context->av1_picture.seq_info_fields.fields.subsampling_x ||
+            !context->av1_picture.seq_info_fields.fields.subsampling_y ||
+            context->av1_picture.seq_info_fields.fields.mono_chrome ||
+            !context->av1_picture.frame_width_minus1 ||
+            !context->av1_picture.frame_height_minus1 ||
+            (unsigned)context->av1_picture.frame_width_minus1 + 1u >
+                context->width ||
+            (unsigned)context->av1_picture.frame_height_minus1 + 1u >
+                context->height)))
+            return VA_STATUS_ERROR_DECODING_ERROR;
+        packet = context->slices;
+        packet_size = context->slice_size;
+        pts_us = (int64_t)context->next_pts_us++;
+        if (!av1_show_existing &&
+            context->av1_picture.pic_info_fields.bits.frame_type == 0)
+            packet_flags |= FMA_PACKET_KEY_FRAME;
+        expects_output = av1_show_existing ||
+            context->av1_picture.pic_info_fields.bits.show_frame;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: AV1 picture surface=%u visible=%ux%u "
+                    "profile=%u bit_depth=%u show=%u show_existing=%u "
+                    "pts=%lld\n",
+                    context->target,
+                    av1_show_existing ? context->width :
+                        (unsigned)context->av1_picture.frame_width_minus1 + 1u,
+                    av1_show_existing ? context->height :
+                        (unsigned)context->av1_picture.frame_height_minus1 + 1u,
+                    context->av1_picture.profile,
+                    context->av1_picture.bit_depth_idx, expects_output,
+                    av1_show_existing,
                     (long long)pts_us);
     } else {
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
@@ -1857,7 +1947,7 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     ctx->pDriverData = driver;
     ctx->version_major = 0;
     ctx->version_minor = 1;
-    ctx->max_profiles = 4;
+    ctx->max_profiles = 5;
     ctx->max_entrypoints = 1;
     ctx->max_attributes = 1;
     ctx->max_image_formats = 1;

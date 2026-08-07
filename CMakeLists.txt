@@ -68,7 +68,7 @@ else()
         target_link_libraries(fma-va-driver-test PRIVATE
             fma-va-driver PkgConfig::LIBVA
         )
-        target_include_directories(fma-va-driver-test PRIVATE src/va)
+        target_include_directories(fma-va-driver-test PRIVATE include src/va)
         add_executable(fma-va-surface-contract-test
             tests/va-surface-contract-test.c)
         target_link_libraries(fma-va-surface-contract-test PRIVATE

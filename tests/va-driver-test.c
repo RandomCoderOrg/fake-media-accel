@@ -4,8 +4,10 @@
 #include <string.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_av1.h>
 #include <va/va_dec_vp9.h>
 
+#include "fma/va_private.h"
 #include "h264_annexb.h"
 
 extern VAStatus __vaDriverInit_1_14(VADriverContextP context);
@@ -24,12 +26,13 @@ int main(void) {
     struct VADriverContext context = {.vtable = &table};
     CHECK(__vaDriverInit_1_14(&context) == VA_STATUS_SUCCESS);
 
-    VAProfile profiles[4];
+    VAProfile profiles[5];
     int profile_count = 0;
     CHECK(table.vaQueryConfigProfiles(&context, profiles, &profile_count) ==
           VA_STATUS_SUCCESS);
-    CHECK(profile_count == 4);
+    CHECK(profile_count == 5);
     CHECK(profiles[3] == VAProfileVP9Profile0);
+    CHECK(profiles[4] == VAProfileAV1Profile0);
     VAConfigID unsupported_config;
     CHECK(table.vaCreateConfig(&context, VAProfileVP9Profile2,
                                VAEntrypointVLD, NULL, 0,
@@ -283,6 +286,91 @@ int main(void) {
     CHECK(table.vaDestroySurfaces(&context, vp9_surfaces, 2) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyConfig(&context, vp9_config) == VA_STATUS_SUCCESS);
+
+    VAConfigID av1_config;
+    CHECK(table.vaCreateConfig(&context, VAProfileAV1Profile0,
+                               VAEntrypointVLD, NULL, 0,
+                               &av1_config) == VA_STATUS_SUCCESS);
+    VASurfaceID av1_surfaces[2];
+    CHECK(table.vaCreateSurfaces(&context, 64, 64, VA_RT_FORMAT_YUV420, 2,
+                                 av1_surfaces) == VA_STATUS_SUCCESS);
+    VAContextID av1_decoder;
+    CHECK(table.vaCreateContext(&context, av1_config, 64, 64, 0,
+                                av1_surfaces, 2, &av1_decoder) ==
+          VA_STATUS_SUCCESS);
+    VADecPictureParameterBufferAV1 av1_picture = {0};
+    av1_picture.profile = 0;
+    av1_picture.bit_depth_idx = 0;
+    av1_picture.frame_width_minus1 = 63;
+    av1_picture.frame_height_minus1 = 63;
+    av1_picture.seq_info_fields.fields.subsampling_x = 1;
+    av1_picture.seq_info_fields.fields.subsampling_y = 1;
+    av1_picture.pic_info_fields.bits.show_frame = 1;
+    static const uint8_t expected_av1_packet[] = {
+        0x12, 0x00, 0x32, 0x02, 0x10, 0x00,
+    };
+    uint8_t av1_private[sizeof(struct fma_va_packet_header) +
+                        sizeof(expected_av1_packet)];
+    struct fma_va_packet_header av1_header = {
+        .magic = FMA_VA_PACKET_MAGIC,
+        .version = FMA_VA_PACKET_VERSION,
+        .codec = FMA_CODEC_AV1,
+        .payload_size = sizeof(expected_av1_packet),
+    };
+    memcpy(av1_private, &av1_header, sizeof(av1_header));
+    memcpy(av1_private + sizeof(av1_header), expected_av1_packet,
+           sizeof(expected_av1_packet));
+    VABufferID av1_buffers[2];
+    CHECK(table.vaCreateBuffer(&context, av1_decoder,
+                               VAPictureParameterBufferType,
+                               sizeof(av1_picture), 1, &av1_picture,
+                               &av1_buffers[0]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, av1_decoder,
+                               (VABufferType)FMA_VA_PACKET_BUFFER_TYPE,
+                               sizeof(av1_private), 1, av1_private,
+                               &av1_buffers[1]) == VA_STATUS_SUCCESS);
+    const char *av1_dump_path = "/tmp/fma-va-driver-test.av1";
+    (void)remove(av1_dump_path);
+    CHECK(setenv("FMA_VA_DUMP", av1_dump_path, 1) == 0);
+    CHECK(table.vaBeginPicture(&context, av1_decoder, av1_surfaces[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, av1_decoder, av1_buffers, 2) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaEndPicture(&context, av1_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaSyncSurface(&context, av1_surfaces[0]) == VA_STATUS_SUCCESS);
+    dump = fopen(av1_dump_path, "rb");
+    CHECK(dump != NULL);
+    uint8_t av1_dumped[sizeof(expected_av1_packet)];
+    CHECK(fread(av1_dumped, 1, sizeof(av1_dumped), dump) ==
+          sizeof(av1_dumped));
+    CHECK(fgetc(dump) == EOF && fclose(dump) == 0);
+    CHECK(memcmp(av1_dumped, expected_av1_packet,
+                 sizeof(av1_dumped)) == 0);
+    CHECK(remove(av1_dump_path) == 0);
+    CHECK(unsetenv("FMA_VA_DUMP") == 0);
+    CHECK(table.vaDestroyBuffer(&context, av1_buffers[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyBuffer(&context, av1_buffers[1]) ==
+          VA_STATUS_SUCCESS);
+
+    av1_header.flags = FMA_VA_PACKET_FLAG_AV1_SHOW_EXISTING;
+    memcpy(av1_private, &av1_header, sizeof(av1_header));
+    CHECK(table.vaCreateBuffer(&context, av1_decoder,
+                               (VABufferType)FMA_VA_PACKET_BUFFER_TYPE,
+                               sizeof(av1_private), 1, av1_private,
+                               &av1_buffers[0]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaBeginPicture(&context, av1_decoder, av1_surfaces[1]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, av1_decoder, av1_buffers, 1) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaEndPicture(&context, av1_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaSyncSurface(&context, av1_surfaces[1]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyBuffer(&context, av1_buffers[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyContext(&context, av1_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroySurfaces(&context, av1_surfaces, 2) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyConfig(&context, av1_config) == VA_STATUS_SUCCESS);
     CHECK(table.vaTerminate(&context) == VA_STATUS_SUCCESS);
     puts("VA driver roundtrip passed");
     return 0;
