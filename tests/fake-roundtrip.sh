@@ -18,7 +18,7 @@ while [ ! -S "$socket" ]; do
     sleep 0.01
 done
 
-result=$("$decoder" --codec hevc --repeat 3 --visible-output \
+result=$("$decoder" --codec hevc --repeat 3 --expect-frames 3 --visible-output \
     --frame-info "$output.csv" "$socket" "$input" 62 64 30 "$output")
 printf '%s\n' "$result"
 case "$result" in

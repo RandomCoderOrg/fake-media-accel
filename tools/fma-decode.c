@@ -307,6 +307,7 @@ static int process_message(struct fma_client *client,
 int main(int argc, char **argv) {
     uint32_t codec = FMA_CODEC_H264;
     uint32_t repeats = 1;
+    uint64_t expected_frames = 0;
     bool visible_output = false;
     const char *frame_info_path = NULL;
     int argument = 1;
@@ -316,6 +317,10 @@ int main(int argc, char **argv) {
             argument += 2;
         } else if (strcmp(argv[argument], "--repeat") == 0 && argument + 1 < argc) {
             repeats = (uint32_t)strtoul(argv[argument + 1], NULL, 10);
+            argument += 2;
+        } else if (strcmp(argv[argument], "--expect-frames") == 0 &&
+                   argument + 1 < argc) {
+            expected_frames = strtoull(argv[argument + 1], NULL, 10);
             argument += 2;
         } else if (strcmp(argv[argument], "--visible-output") == 0) {
             visible_output = true;
@@ -332,6 +337,7 @@ int main(int argc, char **argv) {
     int remaining = argc - argument;
     if (!codec || !repeats || repeats > 1000 || remaining < 5 || remaining > 6) {
         fprintf(stderr, "usage: %s [--codec h264|hevc|vp9|av1] [--repeat N] "
+                "[--expect-frames N] "
                 "[--visible-output] [--frame-info FILE.csv] "
                 "SOCKET INPUT WIDTH HEIGHT FPS [OUTPUT.nv12]\n", argv[0]);
         return 2;
@@ -354,7 +360,10 @@ int main(int argc, char **argv) {
     struct access_unit *units = NULL;
     size_t unit_count = find_access_units(input, input_size, codec, &units);
     if (!unit_count) {
-        perror("could not split input");
+        if (codec == FMA_CODEC_AV1 && errno == ENOTSUP)
+            fprintf(stderr, "AV1 spatial layers are unsupported\n");
+        else
+            perror("could not split input");
         free(input);
         return 1;
     }
@@ -464,6 +473,12 @@ int main(int argc, char **argv) {
         }
     }
     uint64_t elapsed_ns = monotonic_ns() - started_ns;
+    if (expected_frames && frames != expected_frames) {
+        fprintf(stderr, "decoded frame mismatch: expected=%llu actual=%llu\n",
+                (unsigned long long)expected_frames,
+                (unsigned long long)frames);
+        failed = true;
+    }
     frame_bytes = frames * pool.slot_size;
     double seconds = elapsed_ns ? (double)elapsed_ns / 1000000000.0 : 0.0;
     printf("codec=%s repeats=%u packets=%zu frames=%llu elapsed_ms=%.3f "

@@ -68,6 +68,7 @@ struct decoder_session {
     uint64_t packets;
     uint64_t input_buffers;
     uint64_t input_bytes;
+    uint32_t input_chunk_limit;
     uint64_t frames;
     uint64_t frame_bytes;
     uint64_t acquire_ns;
@@ -314,8 +315,9 @@ static int create_decoder(struct decoder_session *session,
                           (int32_t)config->width);
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_HEIGHT,
                           (int32_t)config->height);
+    session->input_chunk_limit = (uint32_t)max_input_size();
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
-                          max_input_size());
+                          (int32_t)session->input_chunk_limit);
     if (AMediaCodec_configure(session->codec, session->format, window, NULL, 0) !=
             AMEDIA_OK ||
         AMediaCodec_start(session->codec) != AMEDIA_OK)
@@ -647,10 +649,19 @@ static int queue_input(struct decoder_session *session,
         size_t capacity = 0;
         uint8_t *buffer = AMediaCodec_getInputBuffer(
             session->codec, (size_t)index, &capacity);
+        if (session->input_chunk_limit &&
+            capacity > session->input_chunk_limit)
+            capacity = session->input_chunk_limit;
         size_t remaining = request->payload_size - offset;
         size_t chunk = remaining < capacity ? remaining : capacity;
         if (!buffer || (!empty_packet && chunk == 0)) {
             errno = ENOBUFS;
+            return -1;
+        }
+        if (remaining > capacity &&
+            (session->codec_id == FMA_CODEC_VP9 ||
+             session->codec_id == FMA_CODEC_AV1)) {
+            errno = EMSGSIZE;
             return -1;
         }
         if (chunk)
