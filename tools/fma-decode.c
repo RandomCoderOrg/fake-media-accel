@@ -1,4 +1,5 @@
 #include "fma/client.h"
+#include "fma/av1_obu.h"
 #include "fma/h264_stream.h"
 #include "fma/ivf.h"
 
@@ -103,6 +104,17 @@ static size_t find_access_units(const uint8_t *data, size_t size,
             return 0;
         }
         for (size_t i = 0; i < stream.frame_count; ++i) {
+            if (codec == FMA_CODEC_AV1) {
+                struct fma_av1_obu_info info;
+                if (fma_av1_scan_obus(data + stream.frames[i].offset,
+                                      stream.frames[i].size, &info) < 0 ||
+                    info.max_spatial_id != 0) {
+                    free(units);
+                    fma_ivf_release(&stream);
+                    errno = info.max_spatial_id ? ENOTSUP : EINVAL;
+                    return 0;
+                }
+            }
             units[i].offset = stream.frames[i].offset;
             units[i].size = stream.frames[i].size;
             if (fma_ivf_timestamp_us(&stream, stream.frames[i].timestamp,
@@ -342,7 +354,7 @@ int main(int argc, char **argv) {
     struct access_unit *units = NULL;
     size_t unit_count = find_access_units(input, input_size, codec, &units);
     if (!unit_count) {
-        fprintf(stderr, "could not split input\n");
+        perror("could not split input");
         free(input);
         return 1;
     }

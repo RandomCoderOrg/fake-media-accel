@@ -7,6 +7,7 @@ set(CMAKE_C_EXTENSIONS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(fma-common STATIC
+    src/common/av1_obu.c
     src/common/h264_stream.c
     src/common/ivf.c
     src/common/protocol.c
@@ -101,9 +102,12 @@ else()
         target_link_libraries(fma-h264-stream-test PRIVATE fma-common)
         add_executable(fma-ivf-test tests/ivf-test.c)
         target_link_libraries(fma-ivf-test PRIVATE fma-common)
+        add_executable(fma-av1-obu-test tests/av1-obu-test.c)
+        target_link_libraries(fma-av1-obu-test PRIVATE fma-common)
         add_test(NAME protocol COMMAND fma-protocol-test)
         add_test(NAME h264-stream COMMAND fma-h264-stream-test)
         add_test(NAME ivf COMMAND fma-ivf-test)
+        add_test(NAME av1-obu COMMAND fma-av1-obu-test)
         add_test(NAME fake-roundtrip
             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/fake-roundtrip.sh
                 $<TARGET_FILE:fake-media-acceld>

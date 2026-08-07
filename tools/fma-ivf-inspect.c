@@ -1,3 +1,4 @@
+#include "fma/av1_obu.h"
 #include "fma/ivf.h"
 
 #include <errno.h>
@@ -56,12 +57,30 @@ int main(int argc, char **argv) {
     size_t payload_bytes = 0;
     size_t min_size = SIZE_MAX;
     size_t max_size = 0;
+    size_t av1_obus = 0;
+    uint8_t max_temporal_id = 0;
+    uint8_t max_spatial_id = 0;
     for (size_t i = 0; i < stream.frame_count; ++i) {
         payload_bytes += stream.frames[i].size;
         if (stream.frames[i].size < min_size)
             min_size = stream.frames[i].size;
         if (stream.frames[i].size > max_size)
             max_size = stream.frames[i].size;
+        if (stream.fourcc == FMA_IVF_AV1) {
+            struct fma_av1_obu_info info;
+            if (fma_av1_scan_obus(data + stream.frames[i].offset,
+                                  stream.frames[i].size, &info) < 0) {
+                perror("AV1 OBU parse");
+                fma_ivf_release(&stream);
+                free(data);
+                return 1;
+            }
+            av1_obus += info.obu_count;
+            if (info.max_temporal_id > max_temporal_id)
+                max_temporal_id = info.max_temporal_id;
+            if (info.max_spatial_id > max_spatial_id)
+                max_spatial_id = info.max_spatial_id;
+        }
     }
     char fourcc[5] = {
         (char)(stream.fourcc & 0xff),
@@ -72,10 +91,14 @@ int main(int argc, char **argv) {
     };
     printf("fourcc=%s width=%u height=%u rate=%u scale=%u "
            "packets=%zu declared_packets=%u payload_bytes=%zu "
-           "min_packet_bytes=%zu max_packet_bytes=%zu\n",
+           "min_packet_bytes=%zu max_packet_bytes=%zu",
            fourcc, stream.width, stream.height, stream.rate, stream.scale,
            stream.frame_count, stream.declared_frames, payload_bytes,
            min_size, max_size);
+    if (stream.fourcc == FMA_IVF_AV1)
+        printf(" av1_obus=%zu max_temporal_id=%u max_spatial_id=%u",
+               av1_obus, max_temporal_id, max_spatial_id);
+    putchar('\n');
     fma_ivf_release(&stream);
     free(data);
     return 0;

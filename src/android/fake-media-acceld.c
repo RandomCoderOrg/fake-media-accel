@@ -1,3 +1,4 @@
+#include "fma/av1_obu.h"
 #include "fma/protocol.h"
 #include "fma/transport.h"
 
@@ -725,12 +726,18 @@ static int serve_client(int fd) {
         case FMA_MSG_QUEUE_PACKET: {
             uint32_t flags = (request.flags & FMA_PACKET_CODEC_CONFIG) ?
                 AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG : 0;
+            struct fma_av1_obu_info av1_info;
+            bool unsupported_av1_layer = session.codec_id == FMA_CODEC_AV1 &&
+                !(request.flags & FMA_PACKET_CODEC_CONFIG) &&
+                (fma_av1_scan_obus(request.payload, request.payload_size,
+                                   &av1_info) < 0 ||
+                 av1_info.max_spatial_id != 0);
             session.packets++;
             session.input_bytes += request.payload_size;
             bool wants_direct = request.fd_count != 0;
             int target_status = wants_direct ?
                 register_target(&session, &request) : 0;
-            if (!session.started || target_status < 0 ||
+            if (!session.started || unsupported_av1_layer || target_status < 0 ||
                 queue_input(&session, &request, flags) < 0 ||
                 emit_output(fd, &request, &session, 0, false) < 0) {
                 struct output_target *target =
