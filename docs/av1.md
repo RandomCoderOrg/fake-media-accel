@@ -81,15 +81,41 @@ before submission. MediaCodec partial-frame input is retained for H.264 only;
 VP9 and AV1 require one complete compressed frame or temporal unit per input
 buffer.
 
-## VA-API boundary
+## VA-API path
 
-The direct codec path is complete, but AV1 is not yet advertised through the
-VA-API driver. Standard AV1 VA decode provides picture state and tile payloads,
-not the original sequence header and complete low-overhead OBU stream that the
-Android component consumes. Supporting it requires a validated AV1 bitstream
-reconstructor or a packet-preserving application adapter. FMA does not invent
-missing syntax or advertise a profile it cannot reproduce correctly.
+The VA driver advertises `VAProfileAV1Profile0` and accepts a packet-preserving
+FMA buffer alongside the standard AV1 picture state. Standard AV1 VA decode
+provides picture state and tile payloads, but omits syntax such as the complete
+sequence header and refresh flags required to reproduce the original
+low-overhead OBU stream. The driver therefore does not guess or reconstruct
+that missing syntax.
 
-This boundary follows libva's AV1 decode structures and FFmpeg's VA-API AV1
-adapter. Main-profile 10-bit output is outside this checkpoint because FMA's
-current public decoded-frame contract is NV12.
+The adapter in [`patches/ffmpeg`](../patches/ffmpeg/README.md) preserves the
+original frame OBUs before FFmpeg discards them. It is gated by FMA's libva
+vendor string, so other VA drivers retain their normal behavior. It also sends
+`show_existing_frame` OBUs to MediaCodec: those frames refer to decoder state
+which exists inside the Android component and cannot be reproduced from a VA
+surface alone.
+
+The on-device VA regression covered four high-value paths:
+
+| Sample | Frames | Visible NV12 | Direct DMA-BUF output |
+| --- | ---: | --- | ---: |
+| Temporal SVC | 8 | byte-exact | 8/8 |
+| Film grain and show-existing | 10 | byte-exact | 10/10 |
+| 1280x720 to 352x288 | 20 | byte-exact | 20/20 |
+| Switch frames | 32 | byte-exact | 32/32 |
+
+The dynamic-size hardware download produced 15,344,640 bytes with MD5
+`7bd7792bc6fb6589e03d048cd74ca69b`, identical to software decode. The probe
+uses `-noautoscale` because preserving the first output size would require a
+software scaler and would no longer test the decoder's native size transition.
+
+Run the application-level comparison with:
+
+```sh
+tools/fma-va-av1-verify.sh INPUT.ivf /path/to/patched-ffmpeg ffmpeg
+```
+
+Main-profile 10-bit output remains outside this checkpoint because FMA's public
+decoded-frame contract is NV12.

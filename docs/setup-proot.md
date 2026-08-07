@@ -192,9 +192,11 @@ check that libva loads the FMA driver:
 vainfo --display x11
 ```
 
-The current VA-API adapter intentionally exposes only H.264 VLD. The Android
-daemon may report additional MediaCodec decoders through `fma-info`, but that
-does not mean the VA-API frontend implements them yet.
+The driver exposes H.264 constrained-baseline/main/high, VP9 Profile 0 and AV1
+Profile 0 VLD when Android reports matching MediaCodec decoders. AV1 requires
+the packet-preserving FFmpeg patch documented in
+[`patches/ffmpeg`](../patches/ffmpeg/README.md); an unpatched FFmpeg can use the
+H.264 and VP9 paths but cannot supply FMA's complete AV1 packet contract.
 
 For a correctness check against FFmpeg's software decoder, use a local H.264
 video:
@@ -210,6 +212,14 @@ launched with the same environment. For example, after installing VLC:
 ```bash
 apt install -y vlc
 vlc --avcodec-hw=vaapi /path/to/h264-video.mp4
+```
+
+With a patched FFmpeg build, compare AV1 hardware output against the distro's
+software decoder before testing a larger application:
+
+```bash
+tools/fma-va-av1-verify.sh /path/to/sample.ivf \
+  /path/to/patched-ffmpeg /usr/bin/ffmpeg
 ```
 
 After verification, put the four environment exports in the desktop session's

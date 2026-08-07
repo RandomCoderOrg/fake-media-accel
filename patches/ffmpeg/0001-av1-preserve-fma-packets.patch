@@ -1,0 +1,313 @@
+diff --git a/libavcodec/av1dec.c b/libavcodec/av1dec.c
+index e08dbdd..f6d5c79 100644
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -1315,6 +1315,18 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
+ 
+                 update_reference_list(avctx);
+ 
++                if (avctx->hwaccel &&
++                    !strcmp(avctx->hwaccel->name, "av1_vaapi") &&
++                    s->cur_frame.f && FF_HW_HAS_CB(avctx, decode_params)) {
++                    ret = FF_HW_CALL(avctx, decode_params, unit->type,
++                                     unit->data, unit->data_size);
++                    if (ret < 0) {
++                        av_log(avctx, AV_LOG_ERROR,
++                               "HW accel show-existing frame failed.\n");
++                        goto end;
++                    }
++                }
++
+                 if (s->cur_frame.f) {
+                     ret = set_output_frame(avctx, frame);
+                     if (ret < 0) {
+diff --git a/libavcodec/vaapi_av1.c b/libavcodec/vaapi_av1.c
+index 0d09640..0a52174 100644
+--- a/libavcodec/vaapi_av1.c
++++ b/libavcodec/vaapi_av1.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <string.h>
++
+ #include "libavutil/frame.h"
+ #include "libavutil/mem.h"
+ #include "hwaccel_internal.h"
+@@ -46,8 +48,217 @@ typedef struct VAAPIAV1DecContext {
+ 
+     int nb_slice_params;
+     VASliceParameterBufferAV1 *slice_params;
++    uint8_t *fma_sequence;
++    size_t fma_sequence_size;
++    int fma_sequence_sent;
+ } VAAPIAV1DecContext;
+ 
++#define FMA_VA_PACKET_BUFFER_TYPE 0x10000
++#define FMA_VA_PACKET_MAGIC UINT32_C(0x50414d46)
++#define FMA_VA_PACKET_VERSION 1
++#define FMA_CODEC_AV1 5
++#define FMA_VA_PACKET_FLAG_AV1_SHOW_EXISTING (UINT32_C(1) << 0)
++
++typedef struct FMAVAPacketHeader {
++    uint32_t magic;
++    uint16_t version;
++    uint16_t codec;
++    uint32_t flags;
++    uint32_t payload_size;
++} FMAVAPacketHeader;
++
++static int vaapi_av1_is_fma(const VAAPIAV1DecContext *ctx)
++{
++    const char *vendor = vaQueryVendorString(ctx->base.hwctx->display);
++    return vendor && strstr(vendor, "fake-media-accel");
++}
++
++static int fma_av1_obu_size(const uint8_t *data, size_t available,
++                            int *type, size_t *total)
++{
++    size_t offset;
++    uint64_t payload = 0;
++    unsigned shift = 0;
++    uint8_t header;
++
++    if (!data || available < 2)
++        return AVERROR_INVALIDDATA;
++    header = data[0];
++    if ((header & 0x81) || !(header & 0x02))
++        return AVERROR_INVALIDDATA;
++    offset = 1 + !!(header & 0x04);
++    if (offset >= available)
++        return AVERROR_INVALIDDATA;
++    for (unsigned i = 0; i < 8 && offset < available; ++i) {
++        uint8_t byte = data[offset++];
++        payload |= (size_t)(byte & 0x7f) << shift;
++        if (!(byte & 0x80)) {
++            if (payload > SIZE_MAX || payload > available - offset)
++                return AVERROR_INVALIDDATA;
++            *type = (header >> 3) & 0x0f;
++            *total = offset + (size_t)payload;
++            return 0;
++        }
++        shift += 7;
++    }
++    return AVERROR_INVALIDDATA;
++}
++
++static int fma_av1_frame_span(const AV1DecContext *s, const uint8_t *buffer,
++                              uint32_t size, const uint8_t **frame,
++                              size_t *frame_size)
++{
++    const uint8_t *packet_end;
++    const uint8_t *cursor;
++    size_t total;
++    int type;
++    int err;
++
++    err = fma_av1_obu_size(buffer, size, &type, &total);
++    if (err < 0)
++        return err;
++    *frame = buffer;
++    *frame_size = total;
++    if (type == AV1_OBU_FRAME)
++        return 0;
++    if (type != AV1_OBU_FRAME_HEADER &&
++        type != AV1_OBU_REDUNDANT_FRAME_HEADER)
++        return AVERROR_INVALIDDATA;
++    if (!s->pkt || !s->pkt->data || s->pkt->size <= 0 ||
++        (uintptr_t)buffer < (uintptr_t)s->pkt->data ||
++        (uintptr_t)buffer > (uintptr_t)s->pkt->data + s->pkt->size ||
++        total > (uintptr_t)s->pkt->data + s->pkt->size -
++                    (uintptr_t)buffer)
++        return AVERROR_INVALIDDATA;
++    packet_end = s->pkt->data + s->pkt->size;
++    cursor = buffer + total;
++    while (cursor < packet_end) {
++        size_t obu_size;
++        int obu_type;
++        err = fma_av1_obu_size(cursor, packet_end - cursor, &obu_type,
++                               &obu_size);
++        if (err < 0)
++            return err;
++        if (obu_type != AV1_OBU_TILE_GROUP &&
++            obu_type != AV1_OBU_METADATA && obu_type != AV1_OBU_PADDING)
++            break;
++        cursor += obu_size;
++        if (obu_type == AV1_OBU_TILE_GROUP)
++            *frame_size = cursor - buffer;
++    }
++    return *frame_size > total ? 0 : AVERROR_INVALIDDATA;
++}
++
++static int vaapi_av1_fma_packet(AVCodecContext *avctx,
++                                VAAPIDecodePicture *pic,
++                                const uint8_t *buffer, uint32_t size)
++{
++    AV1DecContext *s = avctx->priv_data;
++    VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
++    FMAVAPacketHeader *header;
++    const uint8_t *frame;
++    size_t frame_size;
++    size_t sequence_size;
++    size_t bytes;
++    int err;
++
++    if (!vaapi_av1_is_fma(ctx))
++        return 0;
++    err = fma_av1_frame_span(s, buffer, size, &frame, &frame_size);
++    if (err < 0)
++        return err;
++    sequence_size = ctx->fma_sequence_sent ? 0 : ctx->fma_sequence_size;
++    if (sequence_size > UINT32_MAX - frame_size ||
++        sequence_size + frame_size > UINT32_MAX - sizeof(*header))
++        return AVERROR_INVALIDDATA;
++    bytes = sizeof(*header) + sequence_size + frame_size;
++    header = av_malloc(bytes);
++    if (!header)
++        return AVERROR(ENOMEM);
++    *header = (FMAVAPacketHeader) {
++        .magic = FMA_VA_PACKET_MAGIC,
++        .version = FMA_VA_PACKET_VERSION,
++        .codec = FMA_CODEC_AV1,
++        .payload_size = sequence_size + frame_size,
++    };
++    memcpy(header + 1, ctx->fma_sequence, sequence_size);
++    memcpy((uint8_t *)(header + 1) + sequence_size, frame, frame_size);
++    err = ff_vaapi_decode_make_param_buffer(avctx, pic,
++                                            FMA_VA_PACKET_BUFFER_TYPE,
++                                            header, bytes);
++    av_free(header);
++    if (err >= 0)
++        ctx->fma_sequence_sent = 1;
++    return err;
++}
++
++static int vaapi_av1_decode_params(AVCodecContext *avctx, int type,
++                                   const uint8_t *buffer, uint32_t size)
++{
++    AV1DecContext *s = avctx->priv_data;
++    VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
++    uint8_t *sequence;
++
++    if (!vaapi_av1_is_fma(ctx))
++        return 0;
++    if (type == AV1_OBU_SEQUENCE_HEADER) {
++        sequence = av_memdup(buffer, size);
++        if (!sequence)
++            return AVERROR(ENOMEM);
++        av_freep(&ctx->fma_sequence);
++        ctx->fma_sequence = sequence;
++        ctx->fma_sequence_size = size;
++        ctx->fma_sequence_sent = 0;
++        return 0;
++    }
++    if ((type == AV1_OBU_FRAME_HEADER ||
++         type == AV1_OBU_REDUNDANT_FRAME_HEADER) && s->raw_frame_header &&
++        s->raw_frame_header->show_existing_frame && s->cur_frame.f) {
++        VASurfaceID surface = ff_vaapi_get_surface_id(s->cur_frame.f);
++        size_t sequence_size = ctx->fma_sequence_sent ? 0 :
++                               ctx->fma_sequence_size;
++        size_t bytes = sizeof(FMAVAPacketHeader) + sequence_size + size;
++        FMAVAPacketHeader *header;
++        VABufferID id = VA_INVALID_ID;
++        VAStatus vas;
++
++        if (!size || sequence_size > UINT32_MAX - size ||
++            sequence_size + size > UINT32_MAX - sizeof(*header))
++            return AVERROR_INVALIDDATA;
++        header = av_malloc(bytes);
++        if (!header)
++            return AVERROR(ENOMEM);
++        *header = (FMAVAPacketHeader) {
++            .magic = FMA_VA_PACKET_MAGIC,
++            .version = FMA_VA_PACKET_VERSION,
++            .codec = FMA_CODEC_AV1,
++            .flags = FMA_VA_PACKET_FLAG_AV1_SHOW_EXISTING,
++            .payload_size = sequence_size + size,
++        };
++        memcpy(header + 1, ctx->fma_sequence, sequence_size);
++        memcpy((uint8_t *)(header + 1) + sequence_size, buffer, size);
++        vas = vaCreateBuffer(ctx->base.hwctx->display, ctx->base.va_context,
++                             FMA_VA_PACKET_BUFFER_TYPE, bytes, 1, header,
++                             &id);
++        av_free(header);
++        if (vas == VA_STATUS_SUCCESS)
++            vas = vaBeginPicture(ctx->base.hwctx->display,
++                                 ctx->base.va_context, surface);
++        if (vas == VA_STATUS_SUCCESS)
++            vas = vaRenderPicture(ctx->base.hwctx->display,
++                                  ctx->base.va_context, &id, 1);
++        if (vas == VA_STATUS_SUCCESS)
++            vas = vaEndPicture(ctx->base.hwctx->display,
++                               ctx->base.va_context);
++        if (id != VA_INVALID_ID)
++            vaDestroyBuffer(ctx->base.hwctx->display, id);
++        if (vas != VA_STATUS_SUCCESS)
++            return AVERROR(EIO);
++        ctx->fma_sequence_sent = 1;
++    }
++    return 0;
++}
++
+ static VASurfaceID vaapi_av1_surface_id(AV1Frame *vf)
+ {
+     if (vf->f)
+@@ -84,6 +295,7 @@ static av_cold int vaapi_av1_decode_uninit(AVCodecContext *avctx)
+         av_frame_free(&ctx->ref_tab[i].frame);
+ 
+     av_freep(&ctx->slice_params);
++    av_freep(&ctx->fma_sequence);
+ 
+     return ff_vaapi_decode_uninit(avctx);
+ }
+@@ -116,8 +328,7 @@ static av_cold int vaapi_av1_decode_init(AVCodecContext *avctx)
+ 
+ static int vaapi_av1_start_frame(AVCodecContext *avctx,
+                                  av_unused const AVBufferRef *buffer_ref,
+-                                 av_unused const uint8_t *buffer,
+-                                 av_unused uint32_t size)
++                                 const uint8_t *buffer, uint32_t size)
+ {
+     AV1DecContext *s = avctx->priv_data;
+     const AV1RawSequenceHeader *seq = s->raw_seq;
+@@ -128,7 +339,9 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
+     VADecPictureParameterBufferAV1 pic_param;
+     int8_t bit_depth_idx;
+     int err = 0;
+-    int apply_grain = !(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) && film_grain->apply_grain;
++    int apply_grain = !vaapi_av1_is_fma(ctx) &&
++                      !(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) &&
++                      film_grain->apply_grain;
+     uint8_t remap_lr_type[4] = {AV1_RESTORE_NONE, AV1_RESTORE_SWITCHABLE, AV1_RESTORE_WIENER, AV1_RESTORE_SGRPROJ};
+     uint8_t segmentation_feature_signed[AV1_SEG_LVL_MAX] = {1, 1, 1, 1, 1, 0, 0, 0};
+     uint8_t segmentation_feature_max[AV1_SEG_LVL_MAX] = {255, AV1_MAX_LOOP_FILTER,
+@@ -361,6 +574,10 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
+     if (err < 0)
+         goto fail;
+ 
++    err = vaapi_av1_fma_packet(avctx, pic, buffer, size);
++    if (err < 0)
++        goto fail;
++
+     return 0;
+ 
+ fail:
+@@ -376,7 +593,9 @@ static int vaapi_av1_end_frame(AVCodecContext *avctx)
+     VAAPIDecodePicture *pic = s->cur_frame.hwaccel_picture_private;
+     VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
+ 
+-    int apply_grain = !(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) && film_grain->apply_grain;
++    int apply_grain = !vaapi_av1_is_fma(ctx) &&
++                      !(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) &&
++                      film_grain->apply_grain;
+     int ret;
+     ret = ff_vaapi_decode_issue(avctx, pic);
+     if (ret < 0)
+@@ -458,6 +677,7 @@ const FFHWAccel ff_av1_vaapi_hwaccel = {
+     .start_frame          = vaapi_av1_start_frame,
+     .end_frame            = vaapi_av1_end_frame,
+     .decode_slice         = vaapi_av1_decode_slice,
++    .decode_params        = vaapi_av1_decode_params,
+     .frame_priv_data_size = sizeof(VAAPIDecodePicture),
+     .init                 = vaapi_av1_decode_init,
+     .uninit               = vaapi_av1_decode_uninit,

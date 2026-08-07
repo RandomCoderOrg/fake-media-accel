@@ -1,7 +1,9 @@
 # VA-API bridge status
 
-FMA exposes H.264 and VP9 Profile 0 MediaCodec decoding through an ordinary
-VA-API driver. On
+FMA exposes H.264, VP9 Profile 0 and AV1 Profile 0 MediaCodec decoding through
+a VA-API driver. H.264 and VP9 use ordinary VA decode buffers. AV1 additionally
+requires FMA's packet-preserving application adapter because the standard AV1
+VA structures do not contain a complete low-overhead OBU stream. On
 Android systems where `/dev/dma_heap/system` is accessible, decoded NV12
 surfaces are backed by linear DMA-BUFs and can be exported with
 `vaExportSurfaceHandle()` as `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`.
@@ -28,6 +30,9 @@ descriptor.
 - VP9 Profile 0, 8-bit 4:2:0 decode. The complete compressed VP9 frame supplied
   by libva is forwarded unchanged; Profile 2 is rejected because the current
   decoded-frame contract is NV12.
+- AV1 Profile 0, 8-bit 4:2:0 decode through the vendor-gated FFmpeg adapter.
+  Complete frame OBUs, sequence headers and show-existing operations are kept
+  intact for MediaCodec. Unpatched clients cannot use this AV1 path.
 - Exact VA reconstruction for representable 8-bit 4:2:0 streams. POC type 1
   requires the packet-preserving path because the standard VA picture buffer
   omits its SPS offset arrays; the driver rejects it instead of guessing.
@@ -76,7 +81,8 @@ submission, surface synchronization and drain durations. It is intended for
 short controlled probes, not normal playback.
 
 Codec-level corpora, exact-output results and VA boundaries are documented in
-the [H.264 checkpoint](h264.md) and [VP9 checkpoint](vp9.md).
+the [H.264 checkpoint](h264.md), [VP9 checkpoint](vp9.md) and
+[AV1 checkpoint](av1.md).
 
 ## Cost measured on the current 1080p30 sample
 
