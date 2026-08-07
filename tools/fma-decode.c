@@ -1,5 +1,6 @@
 #include "fma/client.h"
 #include "fma/h264_stream.h"
+#include "fma/ivf.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +18,8 @@ struct access_unit {
     size_t offset;
     size_t size;
     uint32_t flags;
+    int64_t pts_us;
+    bool has_pts;
 };
 
 static uint64_t monotonic_ns(void) {
@@ -77,6 +80,43 @@ static size_t find_access_units(const uint8_t *data, size_t size,
         free(h264_units);
         *units_out = units;
         return h264_count;
+    }
+    if (codec == FMA_CODEC_VP9 || codec == FMA_CODEC_AV1) {
+        struct fma_ivf_stream stream;
+        if (fma_ivf_parse(data, size, &stream) < 0)
+            return 0;
+        uint32_t expected_fourcc = codec == FMA_CODEC_VP9 ?
+            FMA_IVF_VP9 : FMA_IVF_AV1;
+        /*
+         * IVF dimensions describe the initial presentation size. VP9 and AV1
+         * streams may change coded size later, so the caller supplies the
+         * decoder/output bounds independently.
+         */
+        if (stream.fourcc != expected_fourcc) {
+            fma_ivf_release(&stream);
+            errno = EINVAL;
+            return 0;
+        }
+        struct access_unit *units = calloc(stream.frame_count, sizeof(*units));
+        if (!units) {
+            fma_ivf_release(&stream);
+            return 0;
+        }
+        for (size_t i = 0; i < stream.frame_count; ++i) {
+            units[i].offset = stream.frames[i].offset;
+            units[i].size = stream.frames[i].size;
+            if (fma_ivf_timestamp_us(&stream, stream.frames[i].timestamp,
+                                     &units[i].pts_us) < 0) {
+                free(units);
+                fma_ivf_release(&stream);
+                return 0;
+            }
+            units[i].has_pts = true;
+        }
+        size_t frame_count = stream.frame_count;
+        fma_ivf_release(&stream);
+        *units_out = units;
+        return frame_count;
     }
     size_t capacity = 64;
     size_t count = 0;
@@ -153,6 +193,10 @@ static uint32_t parse_codec(const char *name) {
         return FMA_CODEC_H264;
     if (strcmp(name, "hevc") == 0 || strcmp(name, "h265") == 0)
         return FMA_CODEC_HEVC;
+    if (strcmp(name, "vp9") == 0)
+        return FMA_CODEC_VP9;
+    if (strcmp(name, "av1") == 0)
+        return FMA_CODEC_AV1;
     return 0;
 }
 
@@ -214,7 +258,7 @@ int main(int argc, char **argv) {
     }
     int remaining = argc - argument;
     if (!codec || !repeats || repeats > 1000 || remaining < 5 || remaining > 6) {
-        fprintf(stderr, "usage: %s [--codec h264|hevc] [--repeat N] "
+        fprintf(stderr, "usage: %s [--codec h264|hevc|vp9|av1] [--repeat N] "
                 "SOCKET INPUT WIDTH HEIGHT FPS [OUTPUT.nv12]\n", argv[0]);
         return 2;
     }
@@ -286,7 +330,8 @@ int main(int argc, char **argv) {
     for (uint32_t repeat = 0; repeat < repeats && !failed; ++repeat) {
         eos = false;
         for (size_t i = 0; i < unit_count; ++i) {
-            int64_t pts_us = (int64_t)(i * UINT64_C(1000000) / fps);
+            int64_t pts_us = units[i].has_pts ? units[i].pts_us :
+                (int64_t)(i * UINT64_C(1000000) / fps);
             bool packet_ack = false;
             bool poll_done = false;
             if (fma_client_queue_packet(&client, input + units[i].offset,

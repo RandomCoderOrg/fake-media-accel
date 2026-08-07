@@ -8,6 +8,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(fma-common STATIC
     src/common/h264_stream.c
+    src/common/ivf.c
     src/common/protocol.c
     src/common/transport.c
 )
@@ -25,6 +26,9 @@ target_link_libraries(fma-decode PRIVATE fma-client)
 
 add_executable(fma-h264-inspect tools/fma-h264-inspect.c)
 target_link_libraries(fma-h264-inspect PRIVATE fma-common)
+
+add_executable(fma-ivf-inspect tools/fma-ivf-inspect.c)
+target_link_libraries(fma-ivf-inspect PRIVATE fma-common)
 
 if(ANDROID)
     add_executable(fake-media-acceld src/android/fake-media-acceld.c)
@@ -95,8 +99,11 @@ else()
         target_link_libraries(fma-protocol-test PRIVATE fma-common)
         add_executable(fma-h264-stream-test tests/h264-stream-test.c)
         target_link_libraries(fma-h264-stream-test PRIVATE fma-common)
+        add_executable(fma-ivf-test tests/ivf-test.c)
+        target_link_libraries(fma-ivf-test PRIVATE fma-common)
         add_test(NAME protocol COMMAND fma-protocol-test)
         add_test(NAME h264-stream COMMAND fma-h264-stream-test)
+        add_test(NAME ivf COMMAND fma-ivf-test)
         add_test(NAME fake-roundtrip
             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/fake-roundtrip.sh
                 $<TARGET_FILE:fake-media-acceld>
