@@ -6,7 +6,7 @@ test_binary=$2
 socket=$3
 
 rm -f "$socket"
-FMA_FAKE_DELAY_OUTPUT=1 "$daemon" "$socket" --once &
+FMA_FAKE_DELAY_OUTPUT=1 "$daemon" "$socket" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true; rm -f "$socket"' EXIT INT TERM
 
@@ -17,7 +17,13 @@ while [ ! -S "$socket" ]; do
     sleep 0.01
 done
 
-FMA_SOCKET="$socket" "$test_binary"
-wait "$daemon_pid"
+if FMA_SOCKET="$socket" "$test_binary"; then
+    status=0
+else
+    status=$?
+fi
+kill "$daemon_pid" 2>/dev/null || true
+wait "$daemon_pid" 2>/dev/null || true
 trap - EXIT INT TERM
 rm -f "$socket"
+exit "$status"

@@ -326,8 +326,12 @@ static int handle_client(int fd) {
 int main(int argc, char **argv) {
     const char *socket_path = argc >= 2 ? argv[1] : "/tmp/fake-media-accel.sock";
     bool once = argc >= 3 && strcmp(argv[2], "--once") == 0;
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
     int server = fma_listen_unix(socket_path, 4);
     if (server < 0) {
         perror("listen");

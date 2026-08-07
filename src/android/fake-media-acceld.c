@@ -818,8 +818,12 @@ int main(int argc, char **argv) {
     if (start_binder_thread_pool() < 0)
         fprintf(stderr, "NDK Binder pool unavailable; using MediaCodec defaults\n");
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
     int server = fma_listen_unix(socket_path, 4);
     if (server < 0) {
         perror("listen");
