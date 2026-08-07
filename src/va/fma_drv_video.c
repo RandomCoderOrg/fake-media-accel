@@ -115,8 +115,14 @@ struct va_context {
     size_t slice_capacity;
     VAPictureParameterBufferH264 picture;
     VASliceParameterBufferH264 first_slice;
+    VASliceParameterBufferH264 *pending_slices;
+    size_t pending_slice_count;
+    size_t pending_slice_capacity;
+    VAIQMatrixBufferH264 iq_matrix;
     bool have_picture;
     bool have_first_slice;
+    bool have_iq_matrix;
+    bool slice_fragment_open;
     bool direct_output;
     uint64_t stored_frames;
 };
@@ -367,6 +373,7 @@ static void close_context(struct va_context *context) {
     if (context->pool_fd >= 0)
         close(context->pool_fd);
     free(context->slices);
+    free(context->pending_slices);
     if (context->io_lock_initialized)
         pthread_mutex_destroy(&context->io_lock);
     memset(context, 0, sizeof(*context));
@@ -1052,8 +1059,11 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
     }
     context->target = target_id;
     context->slice_size = 0;
+    context->pending_slice_count = 0;
     context->have_picture = false;
     context->have_first_slice = false;
+    context->have_iq_matrix = false;
+    context->slice_fragment_open = false;
     surface->pts_us = -1;
     surface->status = VASurfaceRendering;
     return VA_STATUS_SUCCESS;
@@ -1077,21 +1087,69 @@ static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
             bytes >= sizeof(context->picture)) {
             memcpy(&context->picture, buffer->data, sizeof(context->picture));
             context->have_picture = true;
+        } else if (buffer->type == VAIQMatrixBufferType &&
+                   bytes >= sizeof(context->iq_matrix)) {
+            memcpy(&context->iq_matrix, buffer->data,
+                   sizeof(context->iq_matrix));
+            context->have_iq_matrix = true;
         } else if (buffer->type == VASliceParameterBufferType &&
-                   bytes >= sizeof(context->first_slice) &&
-                   !context->have_first_slice) {
-            memcpy(&context->first_slice, buffer->data,
-                   sizeof(context->first_slice));
-            context->have_first_slice = true;
+                   buffer->size >= sizeof(VASliceParameterBufferH264)) {
+            if (context->pending_slice_count != 0)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            size_t count = buffer->elements;
+            if (count > SIZE_MAX / sizeof(*context->pending_slices))
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            if (count > context->pending_slice_capacity) {
+                void *resized = realloc(context->pending_slices,
+                                        count * sizeof(*context->pending_slices));
+                if (!resized)
+                    return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                context->pending_slices = resized;
+                context->pending_slice_capacity = count;
+            }
+            for (size_t j = 0; j < count; ++j)
+                memcpy(&context->pending_slices[j],
+                       (const uint8_t *)buffer->data + j * buffer->size,
+                       sizeof(*context->pending_slices));
+            context->pending_slice_count = count;
         } else if (buffer->type == VASliceDataBufferType && bytes) {
-            if (context->slice_size &&
-                !append_data(&context->slices, &context->slice_size,
-                             &context->slice_capacity, start_code,
-                             sizeof(start_code)))
-                return VA_STATUS_ERROR_ALLOCATION_FAILED;
-            if (!append_data(&context->slices, &context->slice_size,
-                             &context->slice_capacity, buffer->data, bytes))
-                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            if (!context->pending_slice_count)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            for (size_t j = 0; j < context->pending_slice_count; ++j) {
+                const VASliceParameterBufferH264 *parameter =
+                    &context->pending_slices[j];
+                size_t offset = parameter->slice_data_offset;
+                size_t size = parameter->slice_data_size;
+                if (offset > bytes || size > bytes - offset || size == 0)
+                    return VA_STATUS_ERROR_INVALID_PARAMETER;
+                bool begins =
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_ALL ||
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_BEGIN;
+                bool continues =
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_MIDDLE ||
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_END;
+                if ((!begins && !continues) ||
+                    (begins && context->slice_fragment_open) ||
+                    (continues && !context->slice_fragment_open))
+                    return VA_STATUS_ERROR_INVALID_PARAMETER;
+                if (begins && context->slice_size &&
+                    !append_data(&context->slices, &context->slice_size,
+                                 &context->slice_capacity, start_code,
+                                 sizeof(start_code)))
+                    return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                if (!append_data(&context->slices, &context->slice_size,
+                                 &context->slice_capacity,
+                                 (const uint8_t *)buffer->data + offset, size))
+                    return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                if (!context->have_first_slice) {
+                    context->first_slice = *parameter;
+                    context->have_first_slice = true;
+                }
+                context->slice_fragment_open =
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_BEGIN ||
+                    parameter->slice_data_flag == VA_SLICE_DATA_FLAG_MIDDLE;
+            }
+            context->pending_slice_count = 0;
         }
     }
     return VA_STATUS_SUCCESS;
@@ -1105,14 +1163,21 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
     struct va_surface *surface = get_surface(driver, context->target);
     struct va_config *config = get_config(driver, context->config_id);
     if (!surface || !config || !context->have_picture ||
-        !context->have_first_slice)
+        !context->have_first_slice || context->pending_slice_count ||
+        context->slice_fragment_open)
         return VA_STATUS_ERROR_DECODING_ERROR;
     uint8_t *packet = NULL;
     size_t packet_size = 0;
-    if (!fma_h264_build_packet(config->profile, &context->picture,
-                               &context->first_slice, context->slices,
-                               context->slice_size, &packet, &packet_size) ||
+    enum fma_h264_build_status build_status = fma_h264_build_packet(
+        config->profile, &context->picture,
+        context->have_iq_matrix ? &context->iq_matrix : NULL,
+        &context->first_slice, context->slices, context->slice_size,
+        &packet, &packet_size);
+    if (build_status != FMA_H264_BUILD_OK ||
         packet_size > FMA_MAX_PAYLOAD) {
+        if (debug_enabled())
+            fprintf(stderr, "fma-va: H264 packet build failed status=%d\n",
+                    build_status);
         free(packet);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }

@@ -16,6 +16,23 @@ struct bit_reader {
     size_t bit_offset;
 };
 
+struct h264_level_limit {
+    uint8_t level_idc;
+    uint32_t max_fs;
+    uint32_t max_dpb_mbs;
+};
+
+/* H.264 table A-1, beginning at the previously validated level 4.2. */
+static const struct h264_level_limit h264_level_limits[] = {
+    {42, 8704, 34816},
+    {50, 22080, 110400},
+    {51, 36864, 184320},
+    {52, 36864, 184320},
+    {60, 139264, 696320},
+    {61, 139264, 696320},
+    {62, 139264, 696320},
+};
+
 static bool append_bytes(uint8_t **data, size_t *size, size_t *capacity,
                          const void *source, size_t source_size) {
     if (source_size > SIZE_MAX - *size)
@@ -74,6 +91,54 @@ static void put_se(struct bit_writer *writer, int value) {
     unsigned code = value <= 0 ? (unsigned)(-(int64_t)value * 2)
                                : (unsigned)((int64_t)value * 2 - 1);
     put_ue(writer, code);
+}
+
+static const uint8_t zigzag_4x4[16] = {
+    0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
+};
+
+static const uint8_t zigzag_8x8[64] = {
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+};
+
+static bool put_scaling_list(struct bit_writer *writer, const uint8_t *list,
+                             const uint8_t *scan, size_t count) {
+    int last_scale = 8;
+    for (size_t i = 0; i < count; ++i) {
+        int next_scale = list[scan[i]];
+        if (next_scale <= 0)
+            return false;
+        int delta = next_scale - last_scale;
+        while (delta < -128)
+            delta += 256;
+        while (delta > 127)
+            delta -= 256;
+        put_se(writer, delta);
+        last_scale = next_scale;
+    }
+    return !writer->overflow;
+}
+
+static unsigned select_level_idc(
+    const VAPictureParameterBufferH264 *picture) {
+    uint64_t width_mbs = (uint64_t)picture->picture_width_in_mbs_minus1 + 1;
+    uint64_t height_mbs =
+        (uint64_t)picture->picture_height_in_mbs_minus1 + 1;
+    uint64_t frame_mbs = width_mbs * height_mbs;
+    uint64_t buffering = picture->num_ref_frames ? picture->num_ref_frames : 1;
+    for (size_t i = 0;
+         i < sizeof(h264_level_limits) / sizeof(h264_level_limits[0]); ++i) {
+        const struct h264_level_limit *level = &h264_level_limits[i];
+        if (frame_mbs <= level->max_fs &&
+            width_mbs * width_mbs <= UINT64_C(8) * level->max_fs &&
+            height_mbs * height_mbs <= UINT64_C(8) * level->max_fs &&
+            frame_mbs * buffering <= level->max_dpb_mbs)
+            return level->level_idc;
+    }
+    return 0;
 }
 
 static size_t finish_rbsp(struct bit_writer *writer) {
@@ -158,29 +223,47 @@ static unsigned slice_pps_id(const uint8_t *data, size_t size) {
     return pps_id;
 }
 
-bool fma_h264_build_packet(VAProfile profile,
-                           const VAPictureParameterBufferH264 *picture,
-                           const VASliceParameterBufferH264 *slice,
-                           const uint8_t *slice_data, size_t slice_size,
-                           uint8_t **packet, size_t *packet_size) {
+enum fma_h264_build_status fma_h264_build_packet(
+    VAProfile profile, const VAPictureParameterBufferH264 *picture,
+    const VAIQMatrixBufferH264 *iq_matrix,
+    const VASliceParameterBufferH264 *slice,
+    const uint8_t *slice_data, size_t slice_size,
+    uint8_t **packet, size_t *packet_size) {
     if (!picture || !slice || !slice_data || !slice_size || !packet ||
         !packet_size)
-        return false;
+        return FMA_H264_BUILD_INVALID;
     *packet = NULL;
     *packet_size = 0;
+    if (profile != VAProfileH264ConstrainedBaseline &&
+        profile != VAProfileH264Main && profile != VAProfileH264High)
+        return FMA_H264_BUILD_UNREPRESENTABLE;
+    if (picture->seq_fields.bits.chroma_format_idc != 1 ||
+        picture->bit_depth_luma_minus8 != 0 ||
+        picture->bit_depth_chroma_minus8 != 0 ||
+        picture->seq_fields.bits.pic_order_cnt_type > 2)
+        return FMA_H264_BUILD_UNREPRESENTABLE;
+    /*
+     * VA-API omits offset_for_non_ref_pic,
+     * offset_for_top_to_bottom_field and offset_for_ref_frame[]. Guessing
+     * those values creates a syntactically valid but semantically different
+     * stream, so POC type 1 needs the packet-preserving path.
+     */
+    if (picture->seq_fields.bits.pic_order_cnt_type == 1)
+        return FMA_H264_BUILD_UNREPRESENTABLE;
     size_t capacity = 0;
     unsigned profile_idc = profile == VAProfileH264High ? 100 :
                            profile == VAProfileH264Main ? 77 : 66;
     unsigned constraints =
         profile == VAProfileH264ConstrainedBaseline ? 0xc0 : 0;
     unsigned chroma_format = picture->seq_fields.bits.chroma_format_idc;
-    if (!chroma_format)
-        chroma_format = 1;
+    unsigned level_idc = select_level_idc(picture);
+    if (!level_idc)
+        return FMA_H264_BUILD_UNREPRESENTABLE;
 
     struct bit_writer sps = {0};
     put_bits(&sps, profile_idc, 8);
     put_bits(&sps, constraints, 8);
-    put_bits(&sps, 42, 8);
+    put_bits(&sps, level_idc, 8);
     put_ue(&sps, 0);
     if (profile_idc == 100) {
         put_ue(&sps, chroma_format);
@@ -197,13 +280,6 @@ bool fma_h264_build_packet(VAProfile profile,
     if (picture->seq_fields.bits.pic_order_cnt_type == 0)
         put_ue(&sps,
                picture->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4);
-    else if (picture->seq_fields.bits.pic_order_cnt_type == 1) {
-        put_bit(&sps,
-                picture->seq_fields.bits.delta_pic_order_always_zero_flag);
-        put_se(&sps, 0);
-        put_se(&sps, 0);
-        put_ue(&sps, 0);
-    }
     put_ue(&sps, picture->num_ref_frames);
     put_bit(&sps,
             picture->seq_fields.bits.gaps_in_frame_num_value_allowed_flag);
@@ -244,7 +320,7 @@ bool fma_h264_build_packet(VAProfile profile,
     size_t sps_size = finish_rbsp(&sps);
     if (!sps_size || !append_nal(packet, packet_size, &capacity, 0x67,
                                  sps.data, sps_size))
-        goto fail;
+        goto no_memory;
 
     struct bit_writer pps = {0};
     put_ue(&pps, slice_pps_id(slice_data, slice_size));
@@ -265,7 +341,24 @@ bool fma_h264_build_packet(VAProfile profile,
     put_bit(&pps, picture->pic_fields.bits.redundant_pic_cnt_present_flag);
     if (profile_idc == 100) {
         put_bit(&pps, picture->pic_fields.bits.transform_8x8_mode_flag);
-        put_bit(&pps, 0);
+        put_bit(&pps, iq_matrix != NULL);
+        if (iq_matrix) {
+            for (unsigned i = 0; i < 6; ++i) {
+                put_bit(&pps, 1);
+                if (!put_scaling_list(&pps, iq_matrix->ScalingList4x4[i],
+                                      zigzag_4x4, 16))
+                    goto invalid;
+            }
+            if (picture->pic_fields.bits.transform_8x8_mode_flag) {
+                for (unsigned i = 0; i < 2; ++i) {
+                    put_bit(&pps, 1);
+                    if (!put_scaling_list(&pps,
+                                          iq_matrix->ScalingList8x8[i],
+                                          zigzag_8x8, 64))
+                        goto invalid;
+                }
+            }
+        }
         put_se(&pps, picture->second_chroma_qp_index_offset);
     }
     size_t pps_size = finish_rbsp(&pps);
@@ -275,12 +368,18 @@ bool fma_h264_build_packet(VAProfile profile,
         !append_bytes(packet, packet_size, &capacity, start_code,
                       sizeof(start_code)) ||
         !append_bytes(packet, packet_size, &capacity, slice_data, slice_size))
-        goto fail;
-    return true;
+        goto no_memory;
+    return FMA_H264_BUILD_OK;
 
-fail:
+invalid:
     free(*packet);
     *packet = NULL;
     *packet_size = 0;
-    return false;
+    return FMA_H264_BUILD_INVALID;
+
+no_memory:
+    free(*packet);
+    *packet = NULL;
+    *packet_size = 0;
+    return FMA_H264_BUILD_NO_MEMORY;
 }

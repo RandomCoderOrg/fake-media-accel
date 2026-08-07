@@ -51,6 +51,7 @@ int main(void) {
     picture.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 0;
     VASliceParameterBufferH264 slice = {0};
     const uint8_t slice_data[] = {0x65, 0xb8, 0x40};
+    slice.slice_data_size = sizeof(slice_data);
     static const uint8_t expected_packet[] = {
         0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x2a,
         0xac, 0xe8, 0x42, 0x68, 0x06, 0xd0, 0x44, 0x23,
@@ -59,28 +60,106 @@ int main(void) {
     };
     uint8_t *packet = NULL;
     size_t packet_size = 0;
-    CHECK(fma_h264_build_packet(VAProfileH264High, &picture, &slice,
+    CHECK(fma_h264_build_packet(VAProfileH264High, &picture, NULL, &slice,
                                 slice_data, sizeof(slice_data), &packet,
-                                &packet_size));
+                                &packet_size) == FMA_H264_BUILD_OK);
     CHECK(packet_size == sizeof(expected_packet));
     CHECK(memcmp(packet, expected_packet, sizeof(expected_packet)) == 0);
     free(packet);
 
-    VABufferID buffers[3];
+    picture.seq_fields.bits.pic_order_cnt_type = 1;
+    CHECK(fma_h264_build_packet(VAProfileH264High, &picture, NULL, &slice,
+                                slice_data, sizeof(slice_data), &packet,
+                                &packet_size) ==
+          FMA_H264_BUILD_UNREPRESENTABLE);
+    CHECK(packet == NULL && packet_size == 0);
+    picture.seq_fields.bits.pic_order_cnt_type = 0;
+
+    VAPictureParameterBufferH264 uhd_picture = picture;
+    uhd_picture.picture_width_in_mbs_minus1 = 255;
+    uhd_picture.picture_height_in_mbs_minus1 = 134;
+    CHECK(fma_h264_build_packet(VAProfileH264High, &uhd_picture, NULL,
+                                &slice, slice_data, sizeof(slice_data),
+                                &packet, &packet_size) == FMA_H264_BUILD_OK);
+    CHECK(packet_size > 8 && packet[7] == 51);
+    free(packet);
+
+    VAPictureParameterBufferH264 unsupported_picture = picture;
+    unsupported_picture.bit_depth_luma_minus8 = 2;
+    CHECK(fma_h264_build_packet(
+              VAProfileH264High, &unsupported_picture, NULL, &slice,
+              slice_data, sizeof(slice_data), &packet, &packet_size) ==
+          FMA_H264_BUILD_UNREPRESENTABLE);
+
+    VAIQMatrixBufferH264 iq_matrix = {0};
+    memset(iq_matrix.ScalingList4x4, 16,
+           sizeof(iq_matrix.ScalingList4x4));
+    memset(iq_matrix.ScalingList8x8, 16,
+           sizeof(iq_matrix.ScalingList8x8));
+    CHECK(fma_h264_build_packet(VAProfileH264High, &picture, &iq_matrix,
+                                &slice, slice_data, sizeof(slice_data),
+                                &packet, &packet_size) == FMA_H264_BUILD_OK);
+    CHECK(packet_size > sizeof(expected_packet));
+    free(packet);
+
+    VASliceParameterBufferH264 second_slice = slice;
+    const uint8_t second_slice_data[] = {0xff, 0xee, 0x41, 0xe0};
+    second_slice.slice_data_offset = 2;
+    second_slice.slice_data_size = 2;
+    static const uint8_t assembled_slices[] = {
+        0x65, 0xb8, 0x40, 0x00, 0x00, 0x00, 0x01, 0x41, 0xe0,
+    };
+    uint8_t *expected_multi_packet = NULL;
+    size_t expected_multi_packet_size = 0;
+    CHECK(fma_h264_build_packet(
+              VAProfileH264High, &picture, &iq_matrix, &slice,
+              assembled_slices, sizeof(assembled_slices),
+              &expected_multi_packet, &expected_multi_packet_size) ==
+          FMA_H264_BUILD_OK);
+
+    VABufferID buffers[6];
     CHECK(table.vaCreateBuffer(&context, decoder,
                                VAPictureParameterBufferType, sizeof(picture),
                                1, &picture, &buffers[0]) == VA_STATUS_SUCCESS);
     CHECK(table.vaCreateBuffer(&context, decoder,
+                               VAIQMatrixBufferType, sizeof(iq_matrix), 1,
+                               &iq_matrix, &buffers[1]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, decoder,
                                VASliceParameterBufferType, sizeof(slice), 1,
-                               &slice, &buffers[1]) == VA_STATUS_SUCCESS);
+                               &slice, &buffers[2]) == VA_STATUS_SUCCESS);
     CHECK(table.vaCreateBuffer(&context, decoder, VASliceDataBufferType,
                                sizeof(slice_data), 1, (void *)slice_data,
-                               &buffers[2]) == VA_STATUS_SUCCESS);
+                               &buffers[3]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, decoder,
+                               VASliceParameterBufferType,
+                               sizeof(second_slice), 1, &second_slice,
+                               &buffers[4]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, decoder, VASliceDataBufferType,
+                               sizeof(second_slice_data), 1,
+                               (void *)second_slice_data,
+                               &buffers[5]) == VA_STATUS_SUCCESS);
+    const char *dump_path = "/tmp/fma-va-driver-test.h264";
+    (void)remove(dump_path);
+    CHECK(setenv("FMA_VA_DUMP", dump_path, 1) == 0);
     CHECK(table.vaBeginPicture(&context, decoder, surfaces[0]) ==
           VA_STATUS_SUCCESS);
-    CHECK(table.vaRenderPicture(&context, decoder, buffers, 3) ==
+    CHECK(table.vaRenderPicture(&context, decoder, buffers, 6) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaEndPicture(&context, decoder) == VA_STATUS_SUCCESS);
+    FILE *dump = fopen(dump_path, "rb");
+    CHECK(dump != NULL);
+    uint8_t *dumped_packet = malloc(expected_multi_packet_size);
+    CHECK(dumped_packet != NULL);
+    CHECK(fread(dumped_packet, 1, expected_multi_packet_size, dump) ==
+          expected_multi_packet_size);
+    CHECK(fgetc(dump) == EOF);
+    CHECK(fclose(dump) == 0);
+    CHECK(memcmp(dumped_packet, expected_multi_packet,
+                 expected_multi_packet_size) == 0);
+    free(dumped_packet);
+    free(expected_multi_packet);
+    CHECK(remove(dump_path) == 0);
+    CHECK(unsetenv("FMA_VA_DUMP") == 0);
 
     /*
      * The Android backend acknowledges input before MediaCodec necessarily
@@ -96,9 +175,18 @@ int main(void) {
     CHECK(mapped_picture != NULL);
     *mapped_picture = picture;
     CHECK(table.vaUnmapBuffer(&context, buffers[0]) == VA_STATUS_SUCCESS);
+    VASliceParameterBufferH264 *mapped_slice = NULL;
+    CHECK(table.vaMapBuffer(&context, buffers[2], (void **)&mapped_slice) ==
+          VA_STATUS_SUCCESS);
+    mapped_slice->slice_data_flag = VA_SLICE_DATA_FLAG_BEGIN;
+    CHECK(table.vaUnmapBuffer(&context, buffers[2]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaMapBuffer(&context, buffers[4], (void **)&mapped_slice) ==
+          VA_STATUS_SUCCESS);
+    mapped_slice->slice_data_flag = VA_SLICE_DATA_FLAG_END;
+    CHECK(table.vaUnmapBuffer(&context, buffers[4]) == VA_STATUS_SUCCESS);
     CHECK(table.vaBeginPicture(&context, decoder, surfaces[0]) ==
           VA_STATUS_SUCCESS);
-    CHECK(table.vaRenderPicture(&context, decoder, buffers, 3) ==
+    CHECK(table.vaRenderPicture(&context, decoder, buffers, 6) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaEndPicture(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaSyncSurface(&context, surfaces[0]) == VA_STATUS_SUCCESS);
@@ -113,7 +201,7 @@ int main(void) {
     CHECK(table.vaUnmapBuffer(&context, image.buf) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyImage(&context, image.image_id) == VA_STATUS_SUCCESS);
 
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 6; ++i)
         CHECK(table.vaDestroyBuffer(&context, buffers[i]) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyContext(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroySurfaces(&context, surfaces, 2) == VA_STATUS_SUCCESS);
