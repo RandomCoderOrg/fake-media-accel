@@ -252,7 +252,7 @@ index 0d09640..0a52174 100644
  static VASurfaceID vaapi_av1_surface_id(AV1Frame *vf)
  {
      if (vf->f)
-@@ -84,6 +295,7 @@ static av_cold int vaapi_av1_decode_uninit(AVCodecContext *avctx)
+@@ -84,10 +295,19 @@ static av_cold int vaapi_av1_decode_uninit(AVCodecContext *avctx)
          av_frame_free(&ctx->ref_tab[i].frame);
  
      av_freep(&ctx->slice_params);
@@ -260,7 +260,20 @@ index 0d09640..0a52174 100644
  
      return ff_vaapi_decode_uninit(avctx);
  }
-@@ -116,8 +328,7 @@ static av_cold int vaapi_av1_decode_init(AVCodecContext *avctx)
+-
++
++static void vaapi_av1_decode_flush(AVCodecContext *avctx)
++{
++    VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
++
++    if (vaapi_av1_is_fma(ctx))
++        ctx->fma_sequence_sent = 0;
++}
++
+ static av_cold int vaapi_av1_decode_init(AVCodecContext *avctx)
+ {
+     VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
+@@ -116,8 +336,7 @@ static av_cold int vaapi_av1_decode_init(AVCodecContext *avctx)
  
  static int vaapi_av1_start_frame(AVCodecContext *avctx,
                                   av_unused const AVBufferRef *buffer_ref,
@@ -270,7 +283,7 @@ index 0d09640..0a52174 100644
  {
      AV1DecContext *s = avctx->priv_data;
      const AV1RawSequenceHeader *seq = s->raw_seq;
-@@ -128,7 +339,9 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
+@@ -128,7 +347,9 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
      VADecPictureParameterBufferAV1 pic_param;
      int8_t bit_depth_idx;
      int err = 0;
@@ -281,7 +294,7 @@ index 0d09640..0a52174 100644
      uint8_t remap_lr_type[4] = {AV1_RESTORE_NONE, AV1_RESTORE_SWITCHABLE, AV1_RESTORE_WIENER, AV1_RESTORE_SGRPROJ};
      uint8_t segmentation_feature_signed[AV1_SEG_LVL_MAX] = {1, 1, 1, 1, 1, 0, 0, 0};
      uint8_t segmentation_feature_max[AV1_SEG_LVL_MAX] = {255, AV1_MAX_LOOP_FILTER,
-@@ -361,6 +574,10 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
+@@ -361,6 +582,10 @@ static int vaapi_av1_start_frame(AVCodecContext *avctx,
      if (err < 0)
          goto fail;
  
@@ -292,7 +305,7 @@ index 0d09640..0a52174 100644
      return 0;
  
  fail:
-@@ -376,7 +593,9 @@ static int vaapi_av1_end_frame(AVCodecContext *avctx)
+@@ -376,7 +601,9 @@ static int vaapi_av1_end_frame(AVCodecContext *avctx)
      VAAPIDecodePicture *pic = s->cur_frame.hwaccel_picture_private;
      VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
  
@@ -303,7 +316,7 @@ index 0d09640..0a52174 100644
      int ret;
      ret = ff_vaapi_decode_issue(avctx, pic);
      if (ret < 0)
-@@ -458,6 +677,7 @@ const FFHWAccel ff_av1_vaapi_hwaccel = {
+@@ -458,9 +685,11 @@ const FFHWAccel ff_av1_vaapi_hwaccel = {
      .start_frame          = vaapi_av1_start_frame,
      .end_frame            = vaapi_av1_end_frame,
      .decode_slice         = vaapi_av1_decode_slice,
@@ -311,3 +324,7 @@ index 0d09640..0a52174 100644
      .frame_priv_data_size = sizeof(VAAPIDecodePicture),
      .init                 = vaapi_av1_decode_init,
      .uninit               = vaapi_av1_decode_uninit,
++    .flush                = vaapi_av1_decode_flush,
+     .frame_params         = ff_vaapi_common_frame_params,
+     .priv_data_size       = sizeof(VAAPIAV1DecContext),
+     .caps_internal        = HWACCEL_CAP_ASYNC_SAFE,

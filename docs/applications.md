@@ -155,6 +155,36 @@ driver, but its subsequent upload and display remain outside FMA. The selected
 SDL/OpenGL renderer is therefore part of the application environment, not a
 Mali or Panfork dependency of FMA.
 
+## Playback lifecycle checkpoint
+
+The lifecycle probe drives the actual FFplay SDL window rather than restarting
+the decoder for each operation:
+
+```bash
+FMA_FFPLAY=/path/to/patched/ffplay \
+tools/fma-ffplay-lifecycle.sh video.mp4 hardware
+```
+
+It waits for the X11 window, pauses playback, verifies that the media clock is
+held, resumes and verifies clock advancement, then sends an in-process
+ten-second seek. The bounded process-group runner prevents a failed player from
+remaining in the background. `xdotool` is required only by this test probe.
+
+| Codec | Pause | Resume | In-process seek | VA context reuse |
+| --- | --- | --- | --- | --- |
+| H.264 High | Passed | Passed | Passed | One context |
+| VP9 Profile 0 | Passed | Passed | Passed | One context |
+| AV1 Main | Passed | Passed | Passed after sequence-redelivery fix | One context |
+
+The software AV1 control completed the same raw-IVF seek while the first FMA
+attempt stopped after 107 of 360 frames. FFmpeg calls the AV1 hardware
+accelerator's flush callback during a seek, but the initial FMA adapter did not
+mark its cached sequence header for redelivery. Resetting that state on flush
+made the next AV1 packet carry the sequence header again; the hardware run then
+reached the end in the same VA context. FFplay's `fd` counter includes frames
+intentionally skipped by this seek, so it is not treated as a performance-drop
+measurement in this probe.
+
 ## Remaining application work
 
 - Connect the packet-preserving AV1 adapter to additional applications that

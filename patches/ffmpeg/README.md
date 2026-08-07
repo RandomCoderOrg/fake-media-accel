@@ -5,7 +5,9 @@ The patches are deliberately split by responsibility:
 - `0001-av1-preserve-fma-packets.patch` keeps the original low-overhead AV1
   OBUs available when FFmpeg uses the FMA VA-API driver. The adapter activates
   only when libva's vendor string contains `fake-media-accel`; behavior with
-  other VA drivers is unchanged.
+  other VA drivers is unchanged. Its hardware-accelerator flush callback also
+  marks the cached AV1 sequence header for redelivery, allowing the stateful
+  Android decoder to resume after an in-process seek.
 - `0002-ffplay-allow-filtered-vaapi-sdl-output.patch` lets FFplay create a
   standalone VA-API device when its Vulkan renderer is unavailable. This is
   limited to explicitly requested VA-API decoding; other hardware-device types
