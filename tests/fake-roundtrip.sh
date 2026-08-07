@@ -18,7 +18,8 @@ while [ ! -S "$socket" ]; do
     sleep 0.01
 done
 
-result=$("$decoder" --codec hevc --repeat 3 "$socket" "$input" 64 64 30 "$output")
+result=$("$decoder" --codec hevc --repeat 3 --visible-output \
+    --frame-info "$output.csv" "$socket" "$input" 62 64 30 "$output")
 printf '%s\n' "$result"
 case "$result" in
     *"repeats=3 packets=3 frames=3 "*) ;;
@@ -27,3 +28,7 @@ esac
 wait "$daemon_pid"
 trap - EXIT INT TERM
 test -s "$output"
+[ "$(wc -c < "$output")" -eq 17856 ]
+[ "$(wc -l < "$output.csv")" -eq 4 ]
+grep -q '^0,0,5952,62,64,64$' "$output.csv"
+grep -q '^2,11904,5952,62,64,64$' "$output.csv"

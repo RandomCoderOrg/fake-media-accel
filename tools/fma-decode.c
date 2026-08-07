@@ -200,10 +200,41 @@ static uint32_t parse_codec(const char *name) {
     return 0;
 }
 
+static int write_visible_nv12(FILE *output,
+                              const struct fma_frame_pool *pool,
+                              const struct fma_frame *frame,
+                              const uint8_t *slot, size_t *written) {
+    if (!output || !pool || !frame || !slot || !written ||
+        frame->pixel_format != FMA_PIXFMT_NV12 ||
+        frame->stride != pool->stride || !frame->width || !frame->height ||
+        (frame->width & 1u) || (frame->height & 1u) ||
+        frame->width > pool->stride || frame->height > pool->height)
+        return -1;
+    size_t y_allocation = (size_t)pool->stride * pool->height;
+    size_t uv_allocation = y_allocation / 2u;
+    if (y_allocation > pool->slot_size ||
+        uv_allocation > pool->slot_size - y_allocation)
+        return -1;
+    const uint8_t *uv = slot + y_allocation;
+    for (uint32_t row = 0; row < frame->height; ++row) {
+        if (fwrite(slot + (size_t)row * pool->stride, 1,
+                   frame->width, output) != frame->width)
+            return -1;
+    }
+    for (uint32_t row = 0; row < frame->height / 2u; ++row) {
+        if (fwrite(uv + (size_t)row * pool->stride, 1,
+                   frame->width, output) != frame->width)
+            return -1;
+    }
+    *written = (size_t)frame->width * frame->height * 3u / 2u;
+    return 0;
+}
+
 static int process_message(struct fma_client *client,
                            const struct fma_frame_pool *pool, uint8_t *pool_map,
-                           FILE *output, uint64_t *frames, bool *packet_ack,
-                           bool *eos, bool *poll_done) {
+                           FILE *output, bool visible_output, FILE *frame_info,
+                           uint64_t *output_bytes, uint64_t *frames,
+                           bool *packet_ack, bool *eos, bool *poll_done) {
     struct fma_message message;
     if (fma_client_receive(client, &message) < 0)
         return -1;
@@ -215,11 +246,32 @@ static int process_message(struct fma_client *client,
             errno = EPROTO;
             result = -1;
         } else {
-            if (output && fwrite(pool_map + (size_t)frame.slot * pool->slot_size,
-                                 1, frame.bytes_used, output) != frame.bytes_used) {
-                errno = EIO;
-                result = -1;
+            const uint8_t *slot =
+                pool_map + (size_t)frame.slot * pool->slot_size;
+            size_t recorded_bytes = visible_output ?
+                (size_t)frame.width * frame.height * 3u / 2u :
+                frame.bytes_used;
+            if (output) {
+                int write_result = 0;
+                if (visible_output) {
+                    write_result = write_visible_nv12(
+                        output, pool, &frame, slot, &recorded_bytes);
+                } else if (fwrite(slot, 1, frame.bytes_used, output) !=
+                           frame.bytes_used) {
+                    write_result = -1;
+                }
+                if (write_result < 0) {
+                    errno = EIO;
+                    result = -1;
+                }
             }
+            if (frame_info &&
+                fprintf(frame_info, "%llu,%llu,%zu,%u,%u,%u\n",
+                        (unsigned long long)*frames,
+                        (unsigned long long)*output_bytes, recorded_bytes,
+                        frame.width, frame.height, frame.stride) < 0)
+                result = -1;
+            *output_bytes += recorded_bytes;
             ++*frames;
             if (fma_client_release_frame(client, frame.slot) < 0)
                 result = -1;
@@ -243,6 +295,8 @@ static int process_message(struct fma_client *client,
 int main(int argc, char **argv) {
     uint32_t codec = FMA_CODEC_H264;
     uint32_t repeats = 1;
+    bool visible_output = false;
+    const char *frame_info_path = NULL;
     int argument = 1;
     while (argument < argc && strncmp(argv[argument], "--", 2) == 0) {
         if (strcmp(argv[argument], "--codec") == 0 && argument + 1 < argc) {
@@ -250,6 +304,13 @@ int main(int argc, char **argv) {
             argument += 2;
         } else if (strcmp(argv[argument], "--repeat") == 0 && argument + 1 < argc) {
             repeats = (uint32_t)strtoul(argv[argument + 1], NULL, 10);
+            argument += 2;
+        } else if (strcmp(argv[argument], "--visible-output") == 0) {
+            visible_output = true;
+            argument += 1;
+        } else if (strcmp(argv[argument], "--frame-info") == 0 &&
+                   argument + 1 < argc) {
+            frame_info_path = argv[argument + 1];
             argument += 2;
         } else {
             codec = 0;
@@ -259,6 +320,7 @@ int main(int argc, char **argv) {
     int remaining = argc - argument;
     if (!codec || !repeats || repeats > 1000 || remaining < 5 || remaining > 6) {
         fprintf(stderr, "usage: %s [--codec h264|hevc|vp9|av1] [--repeat N] "
+                "[--visible-output] [--frame-info FILE.csv] "
                 "SOCKET INPUT WIDTH HEIGHT FPS [OUTPUT.nv12]\n", argv[0]);
         return 2;
     }
@@ -320,10 +382,20 @@ int main(int argc, char **argv) {
         perror("output");
         return 1;
     }
+    FILE *frame_info = frame_info_path ? fopen(frame_info_path, "w") : NULL;
+    if (frame_info_path && !frame_info) {
+        perror("frame info");
+        if (output)
+            fclose(output);
+        return 1;
+    }
+    if (frame_info)
+        fputs("frame,offset,bytes,width,height,stride\n", frame_info);
 
     uint64_t frames = 0;
     uint64_t frame_bytes = 0;
     uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
     uint64_t started_ns = monotonic_ns();
     bool eos = false;
     bool failed = false;
@@ -343,8 +415,10 @@ int main(int argc, char **argv) {
             }
             input_bytes += units[i].size;
             while (!packet_ack &&
-                   process_message(&client, &pool, pool_map, output, &frames,
-                                   &packet_ack, &eos, &poll_done) == 0) {}
+                   process_message(&client, &pool, pool_map, output,
+                                   visible_output, frame_info, &output_bytes,
+                                   &frames, &packet_ack, &eos,
+                                   &poll_done) == 0) {}
             if (!packet_ack) {
                 perror("decode");
                 failed = true;
@@ -355,17 +429,20 @@ int main(int argc, char **argv) {
             bool packet_ack = false;
             bool poll_done = false;
             while (!poll_done &&
-                   process_message(&client, &pool, pool_map, output, &frames,
-                                   &packet_ack, &eos, &poll_done) == 0) {}
+                   process_message(&client, &pool, pool_map, output,
+                                   visible_output, frame_info, &output_bytes,
+                                   &frames, &packet_ack, &eos,
+                                   &poll_done) == 0) {}
             if (!poll_done)
                 failed = true;
         }
         if (!failed && fma_client_drain(&client) == 0) {
             bool packet_ack = false;
             bool poll_done = false;
-            while (!eos && process_message(&client, &pool, pool_map, output,
-                                           &frames, &packet_ack, &eos,
-                                           &poll_done) == 0) {}
+            while (!eos && process_message(
+                               &client, &pool, pool_map, output,
+                               visible_output, frame_info, &output_bytes,
+                               &frames, &packet_ack, &eos, &poll_done) == 0) {}
         }
         if (!eos)
             failed = true;
@@ -382,12 +459,14 @@ int main(int argc, char **argv) {
            fma_codec_name(codec), repeats, unit_count * (size_t)repeats,
            (unsigned long long)frames, seconds * 1000.0,
            seconds > 0.0 ? (double)frames / seconds : 0.0);
-    printf("compressed_bytes=%llu frame_bytes=%llu shared_pool_bytes=%zu "
-           "socket_frame_bytes=0\n",
+    printf("compressed_bytes=%llu frame_bytes=%llu output_bytes=%llu "
+           "shared_pool_bytes=%zu socket_frame_bytes=0\n",
            (unsigned long long)input_bytes, (unsigned long long)frame_bytes,
-           pool_bytes);
+           (unsigned long long)output_bytes, pool_bytes);
     if (output)
         fclose(output);
+    if (frame_info)
+        fclose(frame_info);
     munmap(pool_map, pool_bytes);
     close(pool_fd);
     fma_client_close(&client);
