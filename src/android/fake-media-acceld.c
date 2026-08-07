@@ -26,6 +26,9 @@
 
 typedef bool (*binder_set_max_threads_fn)(uint32_t);
 typedef void (*binder_start_thread_pool_fn)(void);
+typedef bool (*media_format_get_rect_fn)(AMediaFormat *, const char *,
+                                         int32_t *, int32_t *, int32_t *,
+                                         int32_t *);
 
 #ifndef DMA_BUF_IOCTL_SYNC
 struct dma_buf_sync {
@@ -69,6 +72,8 @@ struct decoder_session {
     uint64_t acquire_ns;
     uint64_t copy_ns;
     bool logged_image_layout;
+    uint32_t visible_width;
+    uint32_t visible_height;
     uint64_t direct_frames;
     struct output_target targets[FMA_MAX_OUTPUT_TARGETS];
 };
@@ -259,6 +264,8 @@ static int create_decoder(struct decoder_session *session,
     if (!mime)
         return -1;
     session->codec_id = config->codec;
+    session->visible_width = config->width;
+    session->visible_height = config->height;
 
     uint32_t stride = (config->width + 63u) & ~63u;
     session->pool = (struct fma_frame_pool) {
@@ -301,6 +308,10 @@ static int create_decoder(struct decoder_session *session,
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_WIDTH,
                           (int32_t)config->width);
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_HEIGHT,
+                          (int32_t)config->height);
+    AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_WIDTH,
+                          (int32_t)config->width);
+    AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_HEIGHT,
                           (int32_t)config->height);
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
                           max_input_size());
@@ -461,11 +472,17 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
     if (target && !sync_dma_buf(target->fd,
                                 DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE))
         return -1;
+    uint32_t visible_width = session->visible_width;
+    uint32_t visible_height = session->visible_height;
+    if (!visible_width || visible_width > (uint32_t)width)
+        visible_width = (uint32_t)width;
+    if (!visible_height || visible_height > (uint32_t)height)
+        visible_height = (uint32_t)height;
     *frame = (struct fma_frame) {
         .slot = target ? FMA_DIRECT_OUTPUT_SLOT : slot,
         .bytes_used = session->pool.slot_size,
-        .width = (uint32_t)width,
-        .height = (uint32_t)height,
+        .width = visible_width,
+        .height = visible_height,
         .stride = session->pool.stride,
         .pixel_format = FMA_PIXFMT_NV12,
     };
@@ -478,6 +495,45 @@ fail:
     return -1;
 }
 
+static void update_output_format(struct decoder_session *session) {
+    AMediaFormat *format = AMediaCodec_getOutputFormat(session->codec);
+    if (!format)
+        return;
+    int32_t width = 0;
+    int32_t height = 0;
+    int32_t crop_left = 0;
+    int32_t crop_top = 0;
+    int32_t crop_right = -1;
+    int32_t crop_bottom = -1;
+    (void)AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &width);
+    (void)AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_HEIGHT, &height);
+    media_format_get_rect_fn get_rect =
+        (media_format_get_rect_fn)dlsym(RTLD_DEFAULT, "AMediaFormat_getRect");
+    bool have_crop = get_rect &&
+        get_rect(format, "crop", &crop_left, &crop_top, &crop_right,
+                 &crop_bottom);
+    if (!have_crop)
+        have_crop =
+        AMediaFormat_getInt32(format, "crop-left", &crop_left) &&
+        AMediaFormat_getInt32(format, "crop-top", &crop_top) &&
+        AMediaFormat_getInt32(format, "crop-right", &crop_right) &&
+        AMediaFormat_getInt32(format, "crop-bottom", &crop_bottom);
+    if (have_crop && crop_right >= crop_left && crop_bottom >= crop_top) {
+        width = crop_right - crop_left + 1;
+        height = crop_bottom - crop_top + 1;
+    }
+    if (width > 0 && height > 0 &&
+        (uint32_t)width <= session->pool.width &&
+        (uint32_t)height <= session->pool.height) {
+        session->visible_width = (uint32_t)width;
+        session->visible_height = (uint32_t)height;
+    }
+    fprintf(stderr, "fma-android-output-format visible=%ux%u %s\n",
+            session->visible_width, session->visible_height,
+            AMediaFormat_toString(format));
+    AMediaFormat_delete(format);
+}
+
 static int emit_output(int fd, const struct fma_message *request,
                        struct decoder_session *session, int64_t timeout_us,
                        bool wait_for_eos) {
@@ -486,8 +542,10 @@ static int emit_output(int fd, const struct fma_message *request,
         AMediaCodecBufferInfo info;
         ssize_t index = AMediaCodec_dequeueOutputBuffer(
             session->codec, &info, empty_polls ? 100000 : timeout_us);
-        if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED)
+        if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            update_output_format(session);
             continue;
+        }
         if (index < 0) {
             if (!wait_for_eos)
                 return 0;
