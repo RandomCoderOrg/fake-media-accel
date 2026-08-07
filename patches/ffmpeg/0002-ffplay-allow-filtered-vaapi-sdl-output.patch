@@ -1,0 +1,22 @@
+diff --git a/fftools/ffplay.c b/fftools/ffplay.c
+index 93eff33..e9b80c1 100644
+--- a/fftools/ffplay.c
++++ b/fftools/ffplay.c
+@@ -2664,8 +2664,15 @@ static int create_hwaccel(AVBufferRef **device_ctx)
+         return AVERROR(ENOTSUP);
+ 
+     if (!vk_renderer) {
+-        av_log(NULL, AV_LOG_ERROR, "Vulkan renderer is not available\n");
+-        return AVERROR(ENOTSUP);
++        if (type != AV_HWDEVICE_TYPE_VAAPI) {
++            av_log(NULL, AV_LOG_ERROR, "Vulkan renderer is not available\n");
++            return AVERROR(ENOTSUP);
++        }
++        const char *device = getenv("DISPLAY");
++        av_log(NULL, AV_LOG_INFO,
++               "Creating a standalone %s device for filtered SDL output\n",
++               hwaccel);
++        return av_hwdevice_ctx_create(device_ctx, type, device, NULL, 0);
+     }
+ 
+     ret = vk_renderer_get_hw_dev(vk_renderer, &vk_dev);

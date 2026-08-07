@@ -18,9 +18,11 @@ jobs:
       - name: Check application probes
         run: |
           sh -n tools/fma-vlc-benchmark.sh
+          sh -n tools/fma-ffplay-benchmark.sh
           python3 -m py_compile tools/fma-measure.py
           tools/fma-measure.py /tmp/fma-measure.txt 5 true
           grep -q '^timed_out=0$' /tmp/fma-measure.txt
+          git apply --numstat patches/ffmpeg/*.patch >/dev/null
 
   android:
     runs-on: ubuntu-latest
