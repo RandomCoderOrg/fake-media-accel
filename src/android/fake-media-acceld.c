@@ -263,20 +263,28 @@ static int create_decoder(struct decoder_session *session,
     session->id = 1;
     session->pool_fd = -1;
     const char *mime = fma_codec_mime(config->codec);
-    if (!mime)
+    if (!mime || !config->width || !config->height || !config->slot_count ||
+        config->width > INT32_MAX || config->height > INT32_MAX ||
+        config->slot_count > FMA_MAX_SLOTS ||
+        config->width > UINT32_MAX - 63u ||
+        config->height > UINT32_MAX - 15u)
         return -1;
     session->codec_id = config->codec;
     session->visible_width = config->width;
     session->visible_height = config->height;
 
     uint32_t stride = (config->width + 63u) & ~63u;
+    uint32_t storage_height = (config->height + 15u) & ~15u;
+    uint64_t slot_size = (uint64_t)stride * storage_height * 3u / 2u;
+    if (slot_size > UINT32_MAX)
+        return -1;
     session->pool = (struct fma_frame_pool) {
         .pixel_format = FMA_PIXFMT_NV12,
         .width = config->width,
-        .height = config->height,
+        .height = storage_height,
         .stride = stride,
         .slot_count = config->slot_count,
-        .slot_size = stride * config->height * 3u / 2u,
+        .slot_size = (uint32_t)slot_size,
     };
     session->pool_bytes = (size_t)session->pool.slot_size * session->pool.slot_count;
     if (session->pool_bytes > FMA_MAX_POOL_BYTES)
