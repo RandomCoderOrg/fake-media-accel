@@ -214,6 +214,12 @@ apt install -y vlc
 vlc --avcodec-hw=vaapi /path/to/h264-video.mp4
 ```
 
+For a bounded hardware/software VLC comparison that also accounts for the
+Android daemon's CPU time, use
+[`tools/fma-vlc-benchmark.sh`](../tools/fma-vlc-benchmark.sh). Results and the
+required graphics environment are documented in
+[`docs/applications.md`](applications.md).
+
 With a patched FFmpeg build, compare AV1 hardware output against the distro's
 software decoder before testing a larger application:
 
