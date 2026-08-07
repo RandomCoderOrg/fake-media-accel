@@ -97,10 +97,12 @@ vendor string, so other VA drivers retain their normal behavior. It also sends
 which exists inside the Android component and cannot be reproduced from a VA
 surface alone.
 
-The on-device VA regression covered four high-value paths:
+The on-device VA regression covered six high-value paths:
 
 | Sample | Frames | Visible NV12 | Direct DMA-BUF output |
 | --- | ---: | --- | ---: |
+| All-intra | 39 | byte-exact | 39/39 |
+| CDF update | 2 | byte-exact | 2/2 |
 | Temporal SVC | 8 | byte-exact | 8/8 |
 | Film grain and show-existing | 10 | byte-exact | 10/10 |
 | 1280x720 to 352x288 | 20 | byte-exact | 20/20 |
