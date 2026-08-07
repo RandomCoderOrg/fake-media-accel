@@ -36,6 +36,10 @@ measure=${FMA_MEASURE:-$script_dir/fma-measure.py}
     exit 2
 }
 daemon_pid=${FMA_DAEMON_PID:-}
+runs=${FMA_RUNS:-1}
+case "$runs" in
+    ''|*[!0-9]*|0) echo "FMA_RUNS must be a positive integer" >&2; exit 2 ;;
+esac
 clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
 process_ticks() {
@@ -55,8 +59,9 @@ metric() {
 run_case() {
     label=$1
     hardware=$2
-    log="$work/$label.log"
-    timing="$work/$label.time"
+    run=$3
+    log="$work/$label-$run.log"
+    timing="$work/$label-$run.time"
     ticks_before=$(process_ticks)
 
     set +e
@@ -93,16 +98,25 @@ run_case() {
             printf "app_cpu_s=%.3f daemon_cpu_s=%.3f total_cpu_s=%.3f", \
                 app, daemon, app + daemon
         }')
-    printf 'result mode=%s exit=%s wall_s=%s %s maxrss_kib=%s late=%s drops=%s vaapi=%s glconv_vaapi=%s\n' \
-        "$label" "$status" "$wall" "$values" "$maxrss" "$late" \
+    printf 'result mode=%s run=%s exit=%s wall_s=%s %s maxrss_kib=%s late=%s drops=%s vaapi=%s glconv_vaapi=%s\n' \
+        "$label" "$run" "$status" "$wall" "$values" "$maxrss" "$late" \
         "$drops" "$vaapi" "$glconv"
     grep -E 'using (glconv|hw decoder) module|fma-va-metrics' "$log" || true
 }
 
-echo "input=$input duration_s=$duration timeout_s=$timeout_seconds logs=$work"
-if [ "$mode" = hardware ] || [ "$mode" = both ]; then
-    run_case hardware vaapi
-fi
-if [ "$mode" = software ] || [ "$mode" = both ]; then
-    run_case software none
-fi
+echo "input=$input duration_s=$duration timeout_s=$timeout_seconds runs=$runs logs=$work"
+run=1
+while [ "$run" -le "$runs" ]; do
+    if [ "$mode" = both ] && [ $((run % 2)) -eq 0 ]; then
+        run_case software none "$run"
+        run_case hardware vaapi "$run"
+    else
+        if [ "$mode" = hardware ] || [ "$mode" = both ]; then
+            run_case hardware vaapi "$run"
+        fi
+        if [ "$mode" = software ] || [ "$mode" = both ]; then
+            run_case software none "$run"
+        fi
+    fi
+    run=$((run + 1))
+done

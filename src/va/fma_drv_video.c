@@ -158,6 +158,10 @@ struct va_image {
 
 struct va_driver {
     uint64_t initialized_ns;
+    uint64_t contexts_created;
+    uint64_t context_create_ns;
+    uint64_t contexts_destroyed;
+    uint64_t context_destroy_ns;
     uint64_t submitted_frames;
     uint64_t submission_ns;
     uint64_t stored_frames;
@@ -562,13 +566,19 @@ static VAStatus terminate(VADriverContextP ctx) {
         return VA_STATUS_SUCCESS;
     if (metrics_enabled())
         fprintf(stderr,
-                "fma-va-metrics submitted=%llu submission_ms=%.3f "
+                "fma-va-metrics contexts_created=%llu create_ms=%.3f "
+                "contexts_destroyed=%llu destroy_ms=%.3f "
+                "submitted=%llu submission_ms=%.3f "
                 "stored=%llu direct=%llu store_copy_mib=%.3f "
                 "store_copy_ms=%.3f "
                 "sync_calls=%llu sync_ms=%.3f derive_calls=%llu "
                 "derive_ms=%.3f surface_maps=%llu acquire_handles=%llu "
                 "get_image_calls=%llu get_image_mib=%.3f "
                 "get_image_ms=%.3f\n",
+                (unsigned long long)driver->contexts_created,
+                (double)driver->context_create_ns / 1000000.0,
+                (unsigned long long)driver->contexts_destroyed,
+                (double)driver->context_destroy_ns / 1000000.0,
                 (unsigned long long)driver->submitted_frames,
                 (double)driver->submission_ns / 1000000.0,
                 (unsigned long long)driver->stored_frames,
@@ -849,6 +859,8 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         context->height = (unsigned)height;
         context->target = VA_INVALID_ID;
         *id = i + 1;
+        driver->contexts_created++;
+        driver->context_create_ns += monotonic_ns() - started_ns;
         if (debug_enabled())
             fprintf(stderr,
                     "fma-va: created context=%u duration_ms=%.3f "
@@ -873,6 +885,8 @@ static VAStatus destroy_context(VADriverContextP ctx, VAContextID id) {
     bool drained = fma_client_drain(&context->client) >= 0 &&
         process_until(driver, context, FMA_MSG_OUTPUT_EOS);
     pthread_mutex_unlock(&context->io_lock);
+    driver->contexts_destroyed++;
+    driver->context_destroy_ns += monotonic_ns() - started_ns;
     if (debug_enabled())
         fprintf(stderr,
                 "fma-va: destroy context drain=%d duration_ms=%.3f "

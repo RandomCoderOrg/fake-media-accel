@@ -31,6 +31,9 @@ FMA_APP_USER=linux-user \
 tools/fma-vlc-benchmark.sh video.mp4 both
 ```
 
+Set `FMA_RUNS=3` for counterbalanced repetitions. Odd runs execute hardware
+first; even runs execute software first, reducing order and thermal bias.
+
 The report separates application CPU from daemon CPU, counts late and dropped
 frames, and verifies both the VA decoder and VA/EGL conversion-module choices.
 Logs remain in the printed temporary directory for diagnosis. The helper sends
@@ -70,9 +73,34 @@ frame data crossed the Unix socket, and the VA driver performed no second
 presentation copy. This reduced total CPU by about 83 percent while preserving
 real-time pacing.
 
+## VP9 real-world checkpoint
+
+A Profile 0 WebM smoke stream was generated from the same local Gravity segment
+at its original 2048 x 858 resolution. It contains 358 frames, lasts 15.015
+seconds and has file MD5 `0751680aa8d6a58bec880f359caf9eac`. Hardware and
+software decoding produced the same visible NV12 MD5,
+`6da6806f19b738f92a01ef10540012fc`.
+
+| Measurement | FMA hardware | Software |
+| --- | ---: | ---: |
+| Decode-throughput CPU | 3.253 s | 11.739 s |
+| Decode-throughput wall time | 3.344 s | 3.551 s |
+| Median VLC wall time | 15.896 s | 16.109 s |
+| Median VLC and presentation CPU | 6.436 s | 24.014 s |
+| Median Android daemon CPU | 3.030 s | 0 s |
+| Median total measured VLC CPU | **9.466 s** | **24.014 s** |
+| Median peak application RSS | 72 MiB | 136 MiB |
+| Late-display warnings | 0 | 0 |
+| Decoder frame drops | 0 | 0 |
+
+These are medians from three counterbalanced runs. Hardware wall time ranged
+from 15.824 to 16.069 seconds; software ranged from 16.078 to 16.210 seconds.
+All 358 VP9 surfaces in every hardware run were direct and exact. Median total
+CPU fell by about 61 percent. Median VA context creation took 85 ms and drain
+plus destruction took 15 ms, ruling out lifecycle setup as a pacing bottleneck.
+
 ## Remaining application work
 
-- Run the same real-time VLC accounting on a representative VP9 source.
 - Connect the packet-preserving AV1 FFmpeg adapter to applications that embed
   libavcodec; VLC 3.0's bundled decoder does not provide FMA's AV1 packet
   contract.
