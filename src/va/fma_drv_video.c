@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_vp9.h>
 #include <va/va_drmcommon.h>
 
 #if defined(__has_include)
@@ -125,6 +126,10 @@ struct va_context {
     bool slice_fragment_open;
     bool direct_output;
     uint64_t stored_frames;
+    uint64_t next_pts_us;
+    VADecPictureParameterBufferVP9 vp9_picture;
+    VASliceParameterBufferVP9 vp9_slice;
+    bool have_vp9_slice;
 };
 
 struct va_buffer {
@@ -335,9 +340,17 @@ static void release_surface(struct va_surface *surface) {
     memset(surface, 0, sizeof(*surface));
 }
 
+static uint32_t codec_for_profile(VAProfile profile) {
+    if (profile == VAProfileH264ConstrainedBaseline ||
+        profile == VAProfileH264Main || profile == VAProfileH264High)
+        return FMA_CODEC_H264;
+    if (profile == VAProfileVP9Profile0)
+        return FMA_CODEC_VP9;
+    return 0;
+}
+
 static bool profile_supported(VAProfile profile) {
-    return profile == VAProfileH264ConstrainedBaseline ||
-           profile == VAProfileH264Main || profile == VAProfileH264High;
+    return codec_for_profile(profile) != 0;
 }
 
 static bool append_data(uint8_t **data, size_t *size, size_t *capacity,
@@ -591,7 +604,8 @@ static VAStatus query_profiles(VADriverContextP ctx, VAProfile *profiles,
     profiles[0] = VAProfileH264ConstrainedBaseline;
     profiles[1] = VAProfileH264Main;
     profiles[2] = VAProfileH264High;
-    *count = 3;
+    profiles[3] = VAProfileVP9Profile0;
+    *count = 4;
     return VA_STATUS_SUCCESS;
 }
 
@@ -773,8 +787,12 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
     (void)flags;
     struct va_driver *driver = ctx->pDriverData;
     uint64_t started_ns = monotonic_ns();
-    if (!id || width <= 0 || height <= 0 || !get_config(driver, config_id))
+    struct va_config *va_config = get_config(driver, config_id);
+    if (!id || width <= 0 || height <= 0 || !va_config)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+    uint32_t codec = codec_for_profile(va_config->profile);
+    if (!codec)
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     for (int i = 0; i < target_count; ++i) {
         struct va_surface *surface = get_surface(driver, targets[i]);
         if (!surface)
@@ -797,12 +815,13 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         if (!socket_path || !*socket_path)
             socket_path = "/tmp/fake-media-accel.sock";
         struct fma_decoder_config config = {
-            .codec = FMA_CODEC_H264, .width = (uint32_t)width,
+            .codec = codec, .width = (uint32_t)width,
             .height = (uint32_t)height, .slot_count = FMA_MAX_SLOTS,
         };
         struct fma_capabilities caps;
         if (fma_client_connect(&context->client, socket_path) < 0 ||
             fma_client_query_capabilities(&context->client, &caps) < 0 ||
+            !(caps.decoder_mask & FMA_CODEC_BIT(codec)) ||
             fma_client_create_decoder(&context->client, &config,
                                       &context->pool, &context->pool_fd) < 0)
             goto fail;
@@ -1063,9 +1082,57 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
     context->have_picture = false;
     context->have_first_slice = false;
     context->have_iq_matrix = false;
+    context->have_vp9_slice = false;
     context->slice_fragment_open = false;
     surface->pts_us = -1;
     surface->status = VASurfaceRendering;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus render_vp9_buffer(struct va_context *context,
+                                  const struct va_buffer *buffer) {
+    size_t bytes = (size_t)buffer->size * buffer->elements;
+    if (buffer->type == VAPictureParameterBufferType) {
+        if (buffer->elements != 1 ||
+            bytes < sizeof(context->vp9_picture))
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        memcpy(&context->vp9_picture, buffer->data,
+               sizeof(context->vp9_picture));
+        context->have_picture = true;
+        return VA_STATUS_SUCCESS;
+    }
+    if (buffer->type == VASliceParameterBufferType) {
+        if (buffer->elements != 1 ||
+            buffer->size < sizeof(context->vp9_slice))
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        memcpy(&context->vp9_slice, buffer->data, sizeof(context->vp9_slice));
+        context->have_vp9_slice = true;
+        return VA_STATUS_SUCCESS;
+    }
+    if (buffer->type != VASliceDataBufferType)
+        return VA_STATUS_SUCCESS;
+    if (!context->have_vp9_slice || !bytes)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    size_t offset = context->vp9_slice.slice_data_offset;
+    size_t size = context->vp9_slice.slice_data_size;
+    if (offset > bytes || !size || size > bytes - offset)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    uint32_t flag = context->vp9_slice.slice_data_flag;
+    bool begins = flag == VA_SLICE_DATA_FLAG_ALL ||
+                  flag == VA_SLICE_DATA_FLAG_BEGIN;
+    bool continues = flag == VA_SLICE_DATA_FLAG_MIDDLE ||
+                     flag == VA_SLICE_DATA_FLAG_END;
+    if ((!begins && !continues) ||
+        (begins && (context->slice_fragment_open || context->slice_size)) ||
+        (continues && !context->slice_fragment_open))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!append_data(&context->slices, &context->slice_size,
+                     &context->slice_capacity,
+                     (const uint8_t *)buffer->data + offset, size))
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    context->have_first_slice = true;
+    context->slice_fragment_open =
+        flag == VA_SLICE_DATA_FLAG_BEGIN || flag == VA_SLICE_DATA_FLAG_MIDDLE;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1077,11 +1144,21 @@ static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (!ids || count < 0)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+    struct va_config *config = get_config(driver, context->config_id);
+    if (!config)
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    uint32_t codec = codec_for_profile(config->profile);
     static const uint8_t start_code[] = {0, 0, 0, 1};
     for (int i = 0; i < count; ++i) {
         struct va_buffer *buffer = get_buffer(driver, ids[i]);
         if (!buffer)
             return VA_STATUS_ERROR_INVALID_BUFFER;
+        if (codec == FMA_CODEC_VP9) {
+            VAStatus status = render_vp9_buffer(context, buffer);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+            continue;
+        }
         size_t bytes = (size_t)buffer->size * buffer->elements;
         if (buffer->type == VAPictureParameterBufferType &&
             bytes >= sizeof(context->picture)) {
@@ -1166,47 +1243,90 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
         !context->have_first_slice || context->pending_slice_count ||
         context->slice_fragment_open)
         return VA_STATUS_ERROR_DECODING_ERROR;
-    uint8_t *packet = NULL;
+    uint32_t codec = codec_for_profile(config->profile);
+    uint8_t *owned_packet = NULL;
+    const uint8_t *packet = NULL;
     size_t packet_size = 0;
-    enum fma_h264_build_status build_status = fma_h264_build_packet(
-        config->profile, &context->picture,
-        context->have_iq_matrix ? &context->iq_matrix : NULL,
-        &context->first_slice, context->slices, context->slice_size,
-        &packet, &packet_size);
-    if (build_status != FMA_H264_BUILD_OK ||
-        packet_size > FMA_MAX_PAYLOAD) {
+    int64_t pts_us = 0;
+    uint32_t packet_flags = 0;
+    bool expects_output = true;
+    if (codec == FMA_CODEC_H264) {
+        enum fma_h264_build_status build_status = fma_h264_build_packet(
+            config->profile, &context->picture,
+            context->have_iq_matrix ? &context->iq_matrix : NULL,
+            &context->first_slice, context->slices, context->slice_size,
+            &owned_packet, &packet_size);
+        if (build_status != FMA_H264_BUILD_OK) {
+            if (debug_enabled())
+                fprintf(stderr,
+                        "fma-va: H264 packet build failed status=%d\n",
+                        build_status);
+            free(owned_packet);
+            return VA_STATUS_ERROR_DECODING_ERROR;
+        }
+        packet = owned_packet;
+        unsigned nal_type =
+            context->slice_size ? context->slices[0] & 0x1fu : 0;
+        pts_us = fma_h264_picture_pts(
+            &context->timeline, context->picture.CurrPic.TopFieldOrderCnt,
+            nal_type == 5);
+        if (nal_type == 5)
+            packet_flags |= FMA_PACKET_KEY_FRAME;
         if (debug_enabled())
-            fprintf(stderr, "fma-va: H264 packet build failed status=%d\n",
-                    build_status);
-        free(packet);
-        return VA_STATUS_ERROR_DECODING_ERROR;
+            fprintf(stderr,
+                    "fma-va: H264 picture surface=%u frame_num=%u "
+                    "top_poc=%d bottom_poc=%d slice_type=%u nal_type=%u "
+                    "pts=%lld\n",
+                    context->target, context->picture.frame_num,
+                    context->picture.CurrPic.TopFieldOrderCnt,
+                    context->picture.CurrPic.BottomFieldOrderCnt,
+                    context->first_slice.slice_type, nal_type,
+                    (long long)pts_us);
+    } else if (codec == FMA_CODEC_VP9) {
+        if (!context->have_vp9_slice || context->vp9_picture.profile != 0 ||
+            context->vp9_picture.bit_depth != 8 ||
+            !context->vp9_picture.pic_fields.bits.subsampling_x ||
+            !context->vp9_picture.pic_fields.bits.subsampling_y ||
+            !context->vp9_picture.frame_width ||
+            !context->vp9_picture.frame_height ||
+            context->vp9_picture.frame_width > context->width ||
+            context->vp9_picture.frame_height > context->height)
+            return VA_STATUS_ERROR_DECODING_ERROR;
+        packet = context->slices;
+        packet_size = context->slice_size;
+        pts_us = (int64_t)context->next_pts_us++;
+        if (!context->vp9_picture.pic_fields.bits.frame_type)
+            packet_flags |= FMA_PACKET_KEY_FRAME;
+        expects_output = context->vp9_picture.pic_fields.bits.show_frame;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: VP9 picture surface=%u visible=%ux%u "
+                    "profile=%u bit_depth=%u show=%u pts=%lld\n",
+                    context->target, context->vp9_picture.frame_width,
+                    context->vp9_picture.frame_height,
+                    context->vp9_picture.profile,
+                    context->vp9_picture.bit_depth, expects_output,
+                    (long long)pts_us);
+    } else {
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
-    unsigned nal_type = context->slice_size ? context->slices[0] & 0x1fu : 0;
-    int64_t pts_us = fma_h264_picture_pts(
-        &context->timeline, context->picture.CurrPic.TopFieldOrderCnt,
-        nal_type == 5);
-    if (debug_enabled()) {
-        fprintf(stderr,
-                "fma-va: picture surface=%u frame_num=%u top_poc=%d "
-                "bottom_poc=%d slice_type=%u nal_type=%u pts=%lld\n",
-                context->target, context->picture.frame_num,
-                context->picture.CurrPic.TopFieldOrderCnt,
-                context->picture.CurrPic.BottomFieldOrderCnt,
-                context->first_slice.slice_type, nal_type,
-                (long long)pts_us);
+    if (!packet || !packet_size || packet_size > FMA_MAX_PAYLOAD) {
+        free(owned_packet);
+        return VA_STATUS_ERROR_DECODING_ERROR;
     }
     surface->pts_us = pts_us;
     dump_packet(packet, packet_size);
     uint64_t started_ns = monotonic_ns();
     pthread_mutex_lock(&context->io_lock);
-    bool direct_output = context->direct_output && surface->dma_buf_fd >= 0 &&
+    bool direct_output = expects_output && context->direct_output &&
+        surface->dma_buf_fd >= 0 &&
         surface->stride == context->pool.stride &&
         surface->allocation_height == context->pool.height &&
         surface->size >= context->pool.slot_size;
     int sent = fma_client_queue_packet_to(
-        &context->client, packet, packet_size, pts_us, 0,
+        &context->client, packet, packet_size, pts_us, packet_flags,
         direct_output ? surface->dma_buf_fd : -1);
-    free(packet);
+    free(owned_packet);
     bool processed = sent >= 0 &&
         process_until(driver, context, FMA_MSG_PACKET_ACK);
     pthread_mutex_unlock(&context->io_lock);
@@ -1219,6 +1339,8 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
                     context->target, (long long)pts_us, sent, errno);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+    if (!expects_output)
+        surface->status = VASurfaceReady;
     if (debug_enabled())
         fprintf(stderr,
                 "fma-va: submitted surface=%u pts=%lld duration_ms=%.3f "
@@ -1735,7 +1857,7 @@ __vaDriverInit_1_14(VADriverContextP ctx) {
     ctx->pDriverData = driver;
     ctx->version_major = 0;
     ctx->version_minor = 1;
-    ctx->max_profiles = 3;
+    ctx->max_profiles = 4;
     ctx->max_entrypoints = 1;
     ctx->max_attributes = 1;
     ctx->max_image_formats = 1;

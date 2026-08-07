@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_vp9.h>
 
 #include "h264_annexb.h"
 
@@ -27,7 +28,13 @@ int main(void) {
     int profile_count = 0;
     CHECK(table.vaQueryConfigProfiles(&context, profiles, &profile_count) ==
           VA_STATUS_SUCCESS);
-    CHECK(profile_count == 3);
+    CHECK(profile_count == 4);
+    CHECK(profiles[3] == VAProfileVP9Profile0);
+    VAConfigID unsupported_config;
+    CHECK(table.vaCreateConfig(&context, VAProfileVP9Profile2,
+                               VAEntrypointVLD, NULL, 0,
+                               &unsupported_config) ==
+          VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
 
     VAConfigID config;
     CHECK(table.vaCreateConfig(&context, VAProfileH264High, VAEntrypointVLD,
@@ -206,6 +213,76 @@ int main(void) {
     CHECK(table.vaDestroyContext(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroySurfaces(&context, surfaces, 2) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyConfig(&context, config) == VA_STATUS_SUCCESS);
+
+    VAConfigID vp9_config;
+    CHECK(table.vaCreateConfig(&context, VAProfileVP9Profile0,
+                               VAEntrypointVLD, NULL, 0,
+                               &vp9_config) == VA_STATUS_SUCCESS);
+    VASurfaceID vp9_surfaces[2];
+    CHECK(table.vaCreateSurfaces(&context, 64, 64, VA_RT_FORMAT_YUV420, 2,
+                                 vp9_surfaces) == VA_STATUS_SUCCESS);
+    VAContextID vp9_decoder;
+    CHECK(table.vaCreateContext(&context, vp9_config, 64, 64, 0,
+                                vp9_surfaces, 2, &vp9_decoder) ==
+          VA_STATUS_SUCCESS);
+    VADecPictureParameterBufferVP9 vp9_picture = {0};
+    vp9_picture.frame_width = 64;
+    vp9_picture.frame_height = 64;
+    vp9_picture.profile = 0;
+    vp9_picture.bit_depth = 8;
+    vp9_picture.pic_fields.bits.subsampling_x = 1;
+    vp9_picture.pic_fields.bits.subsampling_y = 1;
+    vp9_picture.pic_fields.bits.show_frame = 1;
+    VASliceParameterBufferVP9 vp9_slice = {0};
+    static const uint8_t vp9_buffer_data[] = {
+        0xff, 0xee, 0x82, 0x49, 0x83, 0x42,
+    };
+    static const uint8_t expected_vp9_packet[] = {
+        0x82, 0x49, 0x83, 0x42,
+    };
+    vp9_slice.slice_data_offset = 2;
+    vp9_slice.slice_data_size = sizeof(expected_vp9_packet);
+    vp9_slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    VABufferID vp9_buffers[3];
+    CHECK(table.vaCreateBuffer(&context, vp9_decoder,
+                               VAPictureParameterBufferType,
+                               sizeof(vp9_picture), 1, &vp9_picture,
+                               &vp9_buffers[0]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, vp9_decoder,
+                               VASliceParameterBufferType,
+                               sizeof(vp9_slice), 1, &vp9_slice,
+                               &vp9_buffers[1]) == VA_STATUS_SUCCESS);
+    CHECK(table.vaCreateBuffer(&context, vp9_decoder,
+                               VASliceDataBufferType,
+                               sizeof(vp9_buffer_data), 1,
+                               (void *)vp9_buffer_data,
+                               &vp9_buffers[2]) == VA_STATUS_SUCCESS);
+    const char *vp9_dump_path = "/tmp/fma-va-driver-test.vp9";
+    (void)remove(vp9_dump_path);
+    CHECK(setenv("FMA_VA_DUMP", vp9_dump_path, 1) == 0);
+    CHECK(table.vaBeginPicture(&context, vp9_decoder, vp9_surfaces[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, vp9_decoder, vp9_buffers, 3) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaEndPicture(&context, vp9_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaSyncSurface(&context, vp9_surfaces[0]) == VA_STATUS_SUCCESS);
+    dump = fopen(vp9_dump_path, "rb");
+    CHECK(dump != NULL);
+    uint8_t vp9_dumped[sizeof(expected_vp9_packet)];
+    CHECK(fread(vp9_dumped, 1, sizeof(vp9_dumped), dump) ==
+          sizeof(vp9_dumped));
+    CHECK(fgetc(dump) == EOF && fclose(dump) == 0);
+    CHECK(memcmp(vp9_dumped, expected_vp9_packet,
+                 sizeof(vp9_dumped)) == 0);
+    CHECK(remove(vp9_dump_path) == 0);
+    CHECK(unsetenv("FMA_VA_DUMP") == 0);
+    for (unsigned i = 0; i < 3; ++i)
+        CHECK(table.vaDestroyBuffer(&context, vp9_buffers[i]) ==
+              VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyContext(&context, vp9_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroySurfaces(&context, vp9_surfaces, 2) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyConfig(&context, vp9_config) == VA_STATUS_SUCCESS);
     CHECK(table.vaTerminate(&context) == VA_STATUS_SUCCESS);
     puts("VA driver roundtrip passed");
     return 0;
