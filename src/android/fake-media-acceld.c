@@ -62,6 +62,7 @@ struct decoder_session {
     bool started;
     uint32_t codec_id;
     uint64_t packets;
+    uint64_t input_buffers;
     uint64_t input_bytes;
     uint64_t frames;
     uint64_t frame_bytes;
@@ -193,12 +194,14 @@ static int send_error(int fd, const struct fma_message *request, const char *tex
 
 static void destroy_decoder(struct decoder_session *session) {
     if (session->packets) {
-        printf("metrics codec=%s packets=%llu input_bytes=%llu frames=%llu "
+        printf("metrics codec=%s packets=%llu input_buffers=%llu "
+               "input_bytes=%llu frames=%llu "
                "direct_frames=%llu "
                "frame_bytes=%llu acquire_ms=%.3f copy_ms=%.3f "
                "socket_frame_bytes=0\n",
                fma_codec_name(session->codec_id),
                (unsigned long long)session->packets,
+               (unsigned long long)session->input_buffers,
                (unsigned long long)session->input_bytes,
                (unsigned long long)session->frames,
                (unsigned long long)session->direct_frames,
@@ -234,6 +237,17 @@ static uint32_t probe_decoders(void) {
         }
     }
     return mask;
+}
+
+static int32_t max_input_size(void) {
+    const char *value = getenv("FMA_ANDROID_MAX_INPUT_SIZE");
+    if (!value || !*value)
+        return (int32_t)FMA_MAX_PAYLOAD;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    return end && *end == '\0' && parsed > 0 &&
+                   parsed <= (long)FMA_MAX_PAYLOAD ?
+        (int32_t)parsed : (int32_t)FMA_MAX_PAYLOAD;
 }
 
 static int create_decoder(struct decoder_session *session,
@@ -289,7 +303,7 @@ static int create_decoder(struct decoder_session *session,
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_HEIGHT,
                           (int32_t)config->height);
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
-                          4 * 1024 * 1024);
+                          max_input_size());
     if (AMediaCodec_configure(session->codec, session->format, window, NULL, 0) !=
             AMEDIA_OK ||
         AMediaCodec_start(session->codec) != AMEDIA_OK)
@@ -558,21 +572,42 @@ static int receive_frame_release(int fd, struct decoder_session *session) {
 
 static int queue_input(struct decoder_session *session,
                        const struct fma_message *request, uint32_t codec_flags) {
-    for (;;) {
-        ssize_t index = AMediaCodec_dequeueInputBuffer(session->codec, 100000);
-        if (index < 0)
-            continue;
-        size_t capacity = 0;
-        uint8_t *buffer = AMediaCodec_getInputBuffer(session->codec,
-                                                      (size_t)index, &capacity);
-        if (!buffer || capacity < request->payload_size)
+    size_t offset = 0;
+    bool empty_packet = request->payload_size == 0;
+    do {
+        ssize_t index = AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+        for (unsigned attempt = 0; attempt < 50; ++attempt) {
+            index = AMediaCodec_dequeueInputBuffer(session->codec, 100000);
+            if (index >= 0)
+                break;
+        }
+        if (index < 0) {
+            errno = ETIMEDOUT;
             return -1;
-        if (request->payload_size)
-            memcpy(buffer, request->payload, request->payload_size);
-        return AMediaCodec_queueInputBuffer(
-                   session->codec, (size_t)index, 0, request->payload_size,
-                   (uint64_t)request->pts_us, codec_flags) == AMEDIA_OK ? 0 : -1;
-    }
+        }
+        size_t capacity = 0;
+        uint8_t *buffer = AMediaCodec_getInputBuffer(
+            session->codec, (size_t)index, &capacity);
+        size_t remaining = request->payload_size - offset;
+        size_t chunk = remaining < capacity ? remaining : capacity;
+        if (!buffer || (!empty_packet && chunk == 0)) {
+            errno = ENOBUFS;
+            return -1;
+        }
+        if (chunk)
+            memcpy(buffer, request->payload + offset, chunk);
+        uint32_t flags = codec_flags;
+        if (chunk < remaining)
+            flags |= AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME;
+        if (AMediaCodec_queueInputBuffer(
+                session->codec, (size_t)index, 0, chunk,
+                (uint64_t)request->pts_us, flags) != AMEDIA_OK)
+            return -1;
+        ++session->input_buffers;
+        offset += chunk;
+        empty_packet = false;
+    } while (offset < request->payload_size || empty_packet);
+    return 0;
 }
 
 static int serve_client(int fd) {

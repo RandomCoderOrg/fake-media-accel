@@ -18,7 +18,7 @@ while [ ! -S "$socket" ]; do
     sleep 0.01
 done
 
-result=$("$decoder" --repeat 3 "$socket" "$input" 64 64 30 "$output")
+result=$("$decoder" --codec hevc --repeat 3 "$socket" "$input" 64 64 30 "$output")
 printf '%s\n' "$result"
 case "$result" in
     *"repeats=3 packets=3 frames=3 "*) ;;

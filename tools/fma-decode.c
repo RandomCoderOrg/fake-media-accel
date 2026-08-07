@@ -1,4 +1,5 @@
 #include "fma/client.h"
+#include "fma/h264_stream.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 struct access_unit {
     size_t offset;
     size_t size;
+    uint32_t flags;
 };
 
 static uint64_t monotonic_ns(void) {
@@ -56,6 +58,26 @@ static int read_file(const char *path, uint8_t **data, size_t *size) {
 static size_t find_access_units(const uint8_t *data, size_t size,
                                 uint32_t codec,
                                 struct access_unit **units_out) {
+    if (codec == FMA_CODEC_H264) {
+        struct fma_h264_access_unit *h264_units = NULL;
+        size_t h264_count = 0;
+        if (fma_h264_split_annexb(data, size, &h264_units, &h264_count) < 0)
+            return 0;
+        struct access_unit *units = calloc(h264_count, sizeof(*units));
+        if (!units) {
+            free(h264_units);
+            return 0;
+        }
+        for (size_t i = 0; i < h264_count; ++i) {
+            units[i].offset = h264_units[i].offset;
+            units[i].size = h264_units[i].size;
+            units[i].flags = h264_units[i].key_frame ?
+                FMA_PACKET_KEY_FRAME : 0;
+        }
+        free(h264_units);
+        *units_out = units;
+        return h264_count;
+    }
     size_t capacity = 64;
     size_t count = 0;
     struct access_unit *units = calloc(capacity, sizeof(*units));
@@ -87,17 +109,39 @@ static size_t find_access_units(const uint8_t *data, size_t size,
                 }
                 units = grown;
             }
-            units[count++] = (struct access_unit){current, i - current};
+            units[count++] = (struct access_unit) {
+                .offset = current,
+                .size = i - current,
+                .flags = 0,
+            };
         } else {
             found_aud = true;
         }
         current = i;
         i += start_code - 1;
     }
-    if (found_aud && current < size)
-        units[count++] = (struct access_unit){current, size - current};
+    if (found_aud && current < size) {
+        if (count == capacity) {
+            capacity *= 2;
+            void *grown = realloc(units, capacity * sizeof(*units));
+            if (!grown) {
+                free(units);
+                return 0;
+            }
+            units = grown;
+        }
+        units[count++] = (struct access_unit) {
+            .offset = current,
+            .size = size - current,
+            .flags = 0,
+        };
+    }
     if (!found_aud) {
-        units[0] = (struct access_unit){0, size};
+        units[0] = (struct access_unit) {
+            .offset = 0,
+            .size = size,
+            .flags = 0,
+        };
         count = 1;
     }
     *units_out = units;
@@ -246,7 +290,8 @@ int main(int argc, char **argv) {
             bool packet_ack = false;
             bool poll_done = false;
             if (fma_client_queue_packet(&client, input + units[i].offset,
-                                        units[i].size, pts_us, 0) < 0) {
+                                        units[i].size, pts_us,
+                                        units[i].flags) < 0) {
                 perror("decode");
                 failed = true;
                 break;
