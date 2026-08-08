@@ -1,0 +1,498 @@
+diff --git a/libavcodec/vaapi_h264.c b/libavcodec/vaapi_h264.c
+index 7f00da0..3d90676 100644
+--- a/libavcodec/vaapi_h264.c
++++ b/libavcodec/vaapi_h264.c
+@@ -20,9 +20,14 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <errno.h>
++#include <string.h>
++
++#include "libavutil/mem.h"
+ #include "h264dec.h"
+ #include "h264_ps.h"
+ #include "hwaccel_internal.h"
++#include "internal.h"
+ #include "vaapi_decode.h"
+ 
+ /**
+@@ -31,6 +36,392 @@
+  * structures for H.264 decoding.
+  */
+ 
++#define FMA_VA_PACKET_BUFFER_TYPE 0x10000
++#define FMA_VA_PACKET_MAGIC UINT32_C(0x50414d46)
++#define FMA_VA_PACKET_VERSION 1
++#define FMA_CODEC_H264 1
++
++typedef struct FMAVAPacketHeader {
++    uint32_t magic;
++    uint16_t version;
++    uint16_t codec;
++    uint32_t flags;
++    uint32_t payload_size;
++} FMAVAPacketHeader;
++
++typedef struct VAAPIH264DecContext {
++    VAAPIDecodeContext base;
++    uint8_t *fma_packet;
++    size_t fma_packet_size;
++    size_t fma_packet_capacity;
++    uint8_t fma_sps[4096];
++    size_t fma_sps_size;
++    uint8_t fma_pps[4096];
++    size_t fma_pps_size;
++    int fma_configured;
++} VAAPIH264DecContext;
++
++typedef struct FMABitReader {
++    const uint8_t *data;
++    size_t bit_size;
++    size_t bit_offset;
++} FMABitReader;
++
++typedef struct FMABitWriter {
++    uint8_t data[4096];
++    size_t bit_size;
++} FMABitWriter;
++
++static int vaapi_h264_fma_read_bit(FMABitReader *reader, unsigned *value)
++{
++    size_t byte;
++    unsigned shift;
++
++    if (reader->bit_offset >= reader->bit_size)
++        return AVERROR_INVALIDDATA;
++    byte = reader->bit_offset / 8;
++    shift = 7 - reader->bit_offset % 8;
++    *value = reader->data[byte] >> shift & 1;
++    reader->bit_offset++;
++    return 0;
++}
++
++static int vaapi_h264_fma_read_bits(FMABitReader *reader, unsigned count,
++                                    uint32_t *value)
++{
++    uint32_t result = 0;
++    unsigned bit;
++
++    if (count > 32)
++        return AVERROR_INVALIDDATA;
++    for (unsigned i = 0; i < count; i++) {
++        if (vaapi_h264_fma_read_bit(reader, &bit) < 0)
++            return AVERROR_INVALIDDATA;
++        result = result << 1 | bit;
++    }
++    *value = result;
++    return 0;
++}
++
++static int vaapi_h264_fma_read_ue(FMABitReader *reader, uint32_t *value)
++{
++    unsigned leading_zeroes = 0;
++    unsigned bit = 0;
++    uint32_t suffix = 0;
++
++    for (;;) {
++        if (vaapi_h264_fma_read_bit(reader, &bit) < 0)
++            return AVERROR_INVALIDDATA;
++        if (bit)
++            break;
++        if (++leading_zeroes > 31)
++            return AVERROR_INVALIDDATA;
++    }
++    if (leading_zeroes &&
++        vaapi_h264_fma_read_bits(reader, leading_zeroes, &suffix) < 0)
++        return AVERROR_INVALIDDATA;
++    *value = ((UINT32_C(1) << leading_zeroes) - 1) + suffix;
++    return 0;
++}
++
++static int vaapi_h264_fma_skip_se(FMABitReader *reader)
++{
++    uint32_t ignored;
++    return vaapi_h264_fma_read_ue(reader, &ignored);
++}
++
++static int vaapi_h264_fma_skip_scaling_list(FMABitReader *reader,
++                                             unsigned count)
++{
++    int last_scale = 8;
++    int next_scale = 8;
++
++    for (unsigned i = 0; i < count; i++) {
++        if (next_scale) {
++            uint32_t code;
++            int delta;
++            if (vaapi_h264_fma_read_ue(reader, &code) < 0)
++                return AVERROR_INVALIDDATA;
++            delta = code & 1 ? (int)((code + 1) / 2) : -(int)(code / 2);
++            next_scale = (last_scale + delta + 256) % 256;
++        }
++        last_scale = next_scale ? next_scale : last_scale;
++    }
++    return 0;
++}
++
++static int vaapi_h264_fma_put_bit(FMABitWriter *writer, unsigned value)
++{
++    size_t byte;
++    unsigned shift;
++
++    if (writer->bit_size >= sizeof(writer->data) * 8)
++        return AVERROR(ENOSPC);
++    byte = writer->bit_size / 8;
++    shift = 7 - writer->bit_size % 8;
++    if (value & 1)
++        writer->data[byte] |= 1U << shift;
++    writer->bit_size++;
++    return 0;
++}
++
++static int vaapi_h264_fma_put_ue(FMABitWriter *writer, uint32_t value)
++{
++    uint64_t code = (uint64_t)value + 1;
++    unsigned bits = 0;
++
++    for (uint64_t cursor = code; cursor; cursor >>= 1)
++        bits++;
++    for (unsigned i = 1; i < bits; i++)
++        if (vaapi_h264_fma_put_bit(writer, 0) < 0)
++            return AVERROR(ENOSPC);
++    for (unsigned i = bits; i > 0; i--)
++        if (vaapi_h264_fma_put_bit(writer, code >> (i - 1)) < 0)
++            return AVERROR(ENOSPC);
++    return 0;
++}
++
++static int vaapi_h264_fma_high_profile(int profile_idc)
++{
++    switch (profile_idc) {
++    case 44:
++    case 83:
++    case 86:
++    case 100:
++    case 110:
++    case 118:
++    case 122:
++    case 128:
++    case 138:
++    case 144:
++    case 244:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++static int vaapi_h264_fma_sps_prefix_bits(const SPS *sps,
++                                           size_t *prefix_bits)
++{
++    FMABitReader reader = {
++        .data = sps->data,
++        .bit_size = sps->data_size * 8,
++    };
++    uint32_t value;
++    unsigned bit;
++
++    if (sps->data_size < 5 ||
++        vaapi_h264_fma_read_bits(&reader, 8, &value) < 0 ||
++        (value & 0x1f) != H264_NAL_SPS ||
++        vaapi_h264_fma_read_bits(&reader, 24, &value) < 0 ||
++        vaapi_h264_fma_read_ue(&reader, &value) < 0)
++        return AVERROR_INVALIDDATA;
++    if (vaapi_h264_fma_high_profile(sps->profile_idc)) {
++        uint32_t chroma_format;
++        if (vaapi_h264_fma_read_ue(&reader, &chroma_format) < 0 ||
++            chroma_format > 3)
++            return AVERROR_INVALIDDATA;
++        if (chroma_format == 3 &&
++            vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++            return AVERROR_INVALIDDATA;
++        if (vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++            vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++            vaapi_h264_fma_read_bit(&reader, &bit) < 0 ||
++            vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++            return AVERROR_INVALIDDATA;
++        if (bit) {
++            unsigned lists = chroma_format == 3 ? 12 : 8;
++            for (unsigned i = 0; i < lists; i++) {
++                if (vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++                    return AVERROR_INVALIDDATA;
++                if (bit && vaapi_h264_fma_skip_scaling_list(
++                               &reader, i < 6 ? 16 : 64) < 0)
++                    return AVERROR_INVALIDDATA;
++            }
++        }
++    }
++    if (vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++        vaapi_h264_fma_read_ue(&reader, &value) < 0)
++        return AVERROR_INVALIDDATA;
++    if (value == 0) {
++        if (vaapi_h264_fma_read_ue(&reader, &value) < 0)
++            return AVERROR_INVALIDDATA;
++    } else if (value == 1) {
++        uint32_t cycle;
++        if (vaapi_h264_fma_read_bit(&reader, &bit) < 0 ||
++            vaapi_h264_fma_skip_se(&reader) < 0 ||
++            vaapi_h264_fma_skip_se(&reader) < 0 ||
++            vaapi_h264_fma_read_ue(&reader, &cycle) < 0 || cycle > 255)
++            return AVERROR_INVALIDDATA;
++        for (uint32_t i = 0; i < cycle; i++)
++            if (vaapi_h264_fma_skip_se(&reader) < 0)
++                return AVERROR_INVALIDDATA;
++    } else if (value != 2) {
++        return AVERROR_INVALIDDATA;
++    }
++    if (vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++        vaapi_h264_fma_read_bit(&reader, &bit) < 0 ||
++        vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++        vaapi_h264_fma_read_ue(&reader, &value) < 0 ||
++        vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++        return AVERROR_INVALIDDATA;
++    if (!bit && vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++        return AVERROR_INVALIDDATA;
++    if (vaapi_h264_fma_read_bit(&reader, &bit) < 0 ||
++        vaapi_h264_fma_read_bit(&reader, &bit) < 0)
++        return AVERROR_INVALIDDATA;
++    if (bit)
++        for (unsigned i = 0; i < 4; i++)
++            if (vaapi_h264_fma_read_ue(&reader, &value) < 0)
++                return AVERROR_INVALIDDATA;
++    *prefix_bits = reader.bit_offset;
++    return 0;
++}
++
++static int vaapi_h264_fma_sanitize_sps(const SPS *sps, uint8_t *output,
++                                       size_t *output_size)
++{
++    FMABitWriter writer = { 0 };
++    size_t prefix_bits;
++    unsigned buffering = sps->ref_frame_count ? sps->ref_frame_count : 1;
++
++    if (vaapi_h264_fma_sps_prefix_bits(sps, &prefix_bits) < 0)
++        return AVERROR_INVALIDDATA;
++    for (size_t i = 0; i < prefix_bits; i++)
++        if (vaapi_h264_fma_put_bit(&writer,
++                sps->data[i / 8] >> (7 - i % 8)) < 0)
++            return AVERROR(ENOSPC);
++    if (vaapi_h264_fma_put_bit(&writer, 1) < 0 || /* VUI present */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* aspect ratio */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* overscan */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* video signal */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* chroma location */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* timing */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* NAL HRD */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* VCL HRD */
++        vaapi_h264_fma_put_bit(&writer, 0) < 0 || /* pic struct */
++        vaapi_h264_fma_put_bit(&writer, 1) < 0 || /* restriction */
++        vaapi_h264_fma_put_bit(&writer, 1) < 0 || /* MV boundary */
++        vaapi_h264_fma_put_ue(&writer, 2) < 0 ||
++        vaapi_h264_fma_put_ue(&writer, 1) < 0 ||
++        vaapi_h264_fma_put_ue(&writer, 16) < 0 ||
++        vaapi_h264_fma_put_ue(&writer, 16) < 0 ||
++        vaapi_h264_fma_put_ue(&writer, 0) < 0 ||
++        vaapi_h264_fma_put_ue(&writer, buffering) < 0 ||
++        vaapi_h264_fma_put_bit(&writer, 1) < 0)
++        return AVERROR(ENOSPC);
++    while (writer.bit_size % 8)
++        if (vaapi_h264_fma_put_bit(&writer, 0) < 0)
++            return AVERROR(ENOSPC);
++    *output_size = writer.bit_size / 8;
++    memcpy(output, writer.data, *output_size);
++    return 0;
++}
++
++static int vaapi_h264_is_fma(const VAAPIH264DecContext *ctx)
++{
++    const char *vendor = vaQueryVendorString(ctx->base.hwctx->display);
++    return vendor && strstr(vendor, "fake-media-accel");
++}
++
++static int vaapi_h264_fma_append(VAAPIH264DecContext *ctx,
++                                 const uint8_t *data, size_t size,
++                                 int escape)
++{
++    static const uint8_t start_code[] = { 0, 0, 0, 1 };
++    size_t needed;
++    size_t offset;
++    uint8_t *packet;
++    unsigned zeroes = 0;
++
++    if (!data || !size || size > (SIZE_MAX - sizeof(start_code)) / 2 ||
++        ctx->fma_packet_size > SIZE_MAX - sizeof(start_code) - size * 2)
++        return AVERROR_INVALIDDATA;
++    needed = ctx->fma_packet_size + sizeof(start_code) + size * 2;
++    if (needed > ctx->fma_packet_capacity) {
++        size_t capacity = ctx->fma_packet_capacity ?
++                          ctx->fma_packet_capacity : 1024;
++        while (capacity < needed) {
++            if (capacity > SIZE_MAX / 2) {
++                capacity = needed;
++                break;
++            }
++            capacity *= 2;
++        }
++        packet = av_realloc(ctx->fma_packet, capacity);
++        if (!packet)
++            return AVERROR(ENOMEM);
++        ctx->fma_packet = packet;
++        ctx->fma_packet_capacity = capacity;
++    }
++    packet = ctx->fma_packet;
++    offset = ctx->fma_packet_size;
++    memcpy(packet + offset, start_code, sizeof(start_code));
++    offset += sizeof(start_code);
++    for (size_t i = 0; i < size; ++i) {
++        if (escape && zeroes >= 2 && data[i] <= 3) {
++            packet[offset++] = 3;
++            zeroes = 0;
++        }
++        packet[offset++] = data[i];
++        zeroes = data[i] == 0 ? zeroes + 1 : 0;
++    }
++    ctx->fma_packet_size = offset;
++    return 0;
++}
++
++static int vaapi_h264_fma_parameters_changed(const VAAPIH264DecContext *ctx,
++                                              const SPS *sps, const PPS *pps)
++{
++    return !ctx->fma_configured ||
++           ctx->fma_sps_size != sps->data_size ||
++           ctx->fma_pps_size != pps->data_size ||
++           memcmp(ctx->fma_sps, sps->data, sps->data_size) ||
++           memcmp(ctx->fma_pps, pps->data, pps->data_size);
++}
++
++static int vaapi_h264_fma_make_packet(AVCodecContext *avctx,
++                                      VAAPIDecodePicture *pic)
++{
++    VAAPIH264DecContext *ctx = avctx->internal->hwaccel_priv_data;
++    FMAVAPacketHeader *header;
++    size_t bytes;
++    int err;
++
++    if (!vaapi_h264_is_fma(ctx))
++        return 0;
++    if (!ctx->fma_packet_size || ctx->fma_packet_size > UINT32_MAX ||
++        ctx->fma_packet_size > SIZE_MAX - sizeof(*header))
++        return AVERROR_INVALIDDATA;
++    bytes = sizeof(*header) + ctx->fma_packet_size;
++    header = av_malloc(bytes);
++    if (!header)
++        return AVERROR(ENOMEM);
++    *header = (FMAVAPacketHeader) {
++        .magic = FMA_VA_PACKET_MAGIC,
++        .version = FMA_VA_PACKET_VERSION,
++        .codec = FMA_CODEC_H264,
++        .payload_size = ctx->fma_packet_size,
++    };
++    memcpy(header + 1, ctx->fma_packet, ctx->fma_packet_size);
++    err = ff_vaapi_decode_make_param_buffer(avctx, pic,
++                                            FMA_VA_PACKET_BUFFER_TYPE,
++                                            header, bytes);
++    av_free(header);
++    return err;
++}
++
++static av_cold int vaapi_h264_decode_uninit(AVCodecContext *avctx)
++{
++    VAAPIH264DecContext *ctx = avctx->internal->hwaccel_priv_data;
++
++    av_freep(&ctx->fma_packet);
++    ctx->fma_packet_size = 0;
++    ctx->fma_packet_capacity = 0;
++    return ff_vaapi_decode_uninit(avctx);
++}
++
+ /**
+  * Initialize an empty VA API picture.
+  *
+@@ -237,6 +628,7 @@ static int vaapi_h264_start_frame(AVCodecContext          *avctx,
+                                   av_unused uint32_t       size)
+ {
+     const H264Context *h = avctx->priv_data;
++    VAAPIH264DecContext *ctx = avctx->internal->hwaccel_priv_data;
+     VAAPIDecodePicture *pic = h->cur_pic_ptr->hwaccel_picture_private;
+     const PPS *pps = h->ps.pps;
+     const SPS *sps = h->ps.sps;
+@@ -246,6 +638,32 @@ static int vaapi_h264_start_frame(AVCodecContext          *avctx,
+ 
+     pic->output_surface = ff_vaapi_get_surface_id(h->cur_pic_ptr->f);
+ 
++    ctx->fma_packet_size = 0;
++    if (vaapi_h264_is_fma(ctx)) {
++        uint8_t sanitized_sps[4096];
++        size_t sanitized_sps_size;
++        int parameters_changed =
++            vaapi_h264_fma_parameters_changed(ctx, sps, pps);
++        if (parameters_changed || h->nal_unit_type == H264_NAL_IDR_SLICE) {
++            err = vaapi_h264_fma_sanitize_sps(sps, sanitized_sps,
++                                              &sanitized_sps_size);
++            if (err < 0)
++                goto fail;
++            err = vaapi_h264_fma_append(ctx, sanitized_sps,
++                                        sanitized_sps_size, 1);
++            if (err < 0)
++                goto fail;
++            err = vaapi_h264_fma_append(ctx, pps->data, pps->data_size, 1);
++            if (err < 0)
++                goto fail;
++            memcpy(ctx->fma_sps, sps->data, sps->data_size);
++            ctx->fma_sps_size = sps->data_size;
++            memcpy(ctx->fma_pps, pps->data, pps->data_size);
++            ctx->fma_pps_size = pps->data_size;
++            ctx->fma_configured = 1;
++        }
++    }
++
+     pic_param = (VAPictureParameterBufferH264) {
+         .picture_width_in_mbs_minus1                = h->mb_width - 1,
+         .picture_height_in_mbs_minus1               = h->mb_height - 1,
+@@ -323,6 +741,10 @@ static int vaapi_h264_end_frame(AVCodecContext *avctx)
+     H264SliceContext *sl = &h->slice_ctx[0];
+     int ret;
+ 
++    ret = vaapi_h264_fma_make_packet(avctx, pic);
++    if (ret < 0)
++        goto finish;
++
+     ret = ff_vaapi_decode_issue(avctx, pic);
+     if (ret < 0)
+         goto finish;
+@@ -339,6 +761,7 @@ static int vaapi_h264_decode_slice(AVCodecContext *avctx,
+                                    uint32_t        size)
+ {
+     const H264Context *h = avctx->priv_data;
++    VAAPIH264DecContext *ctx = avctx->internal->hwaccel_priv_data;
+     VAAPIDecodePicture *pic = h->cur_pic_ptr->hwaccel_picture_private;
+     const H264SliceContext *sl  = &h->slice_ctx[0];
+     VASliceParameterBufferH264 slice_param;
+@@ -391,6 +814,14 @@ static int vaapi_h264_decode_slice(AVCodecContext *avctx,
+         return err;
+     }
+ 
++    if (vaapi_h264_is_fma(ctx)) {
++        err = vaapi_h264_fma_append(ctx, buffer, size, 0);
++        if (err < 0) {
++            ff_vaapi_decode_cancel(avctx, pic);
++            return err;
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -404,8 +835,8 @@ const FFHWAccel ff_h264_vaapi_hwaccel = {
+     .decode_slice         = &vaapi_h264_decode_slice,
+     .frame_priv_data_size = sizeof(VAAPIDecodePicture),
+     .init                 = &ff_vaapi_decode_init,
+-    .uninit               = &ff_vaapi_decode_uninit,
++    .uninit               = &vaapi_h264_decode_uninit,
+     .frame_params         = &ff_vaapi_common_frame_params,
+-    .priv_data_size       = sizeof(VAAPIDecodeContext),
++    .priv_data_size       = sizeof(VAAPIH264DecContext),
+     .caps_internal        = HWACCEL_CAP_ASYNC_SAFE,
+ };

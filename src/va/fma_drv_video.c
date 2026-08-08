@@ -122,6 +122,10 @@ struct va_context {
     uint8_t *slices;
     size_t slice_size;
     size_t slice_capacity;
+    uint8_t *h264_packet;
+    size_t h264_packet_size;
+    size_t h264_packet_capacity;
+    bool have_h264_packet;
     VAPictureParameterBufferH264 picture;
     VASliceParameterBufferH264 first_slice;
     VASliceParameterBufferH264 *pending_slices;
@@ -228,6 +232,24 @@ static void dump_packet(const uint8_t *packet, size_t packet_size) {
         perror("fma-va: write packet dump");
     if (fclose(file) != 0 && debug_enabled())
         perror("fma-va: close packet dump");
+}
+
+static unsigned h264_first_vcl_nal_type(const uint8_t *packet, size_t size) {
+    for (size_t i = 0; i + 3 < size; ++i) {
+        size_t header = 0;
+        if (packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1)
+            header = i + 3;
+        else if (i + 4 < size && packet[i] == 0 && packet[i + 1] == 0 &&
+                 packet[i + 2] == 0 && packet[i + 3] == 1)
+            header = i + 4;
+        if (!header || header >= size)
+            continue;
+        unsigned type = packet[header] & 0x1fu;
+        if (type >= 1 && type <= 5)
+            return type;
+        i = header;
+    }
+    return 0;
 }
 
 static struct va_config *get_config(struct va_driver *driver, VAConfigID id) {
@@ -415,6 +437,7 @@ static void close_context(struct va_context *context) {
     if (context->pool_fd >= 0)
         close(context->pool_fd);
     free(context->slices);
+    free(context->h264_packet);
     free(context->pending_slices);
     if (context->io_lock_initialized)
         pthread_mutex_destroy(&context->io_lock);
@@ -867,6 +890,8 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         context->height = (unsigned)height;
         context->target = VA_INVALID_ID;
         context->slice_size = 0;
+        context->h264_packet_size = 0;
+        context->have_h264_packet = false;
         context->pending_slice_count = 0;
         context->have_picture = false;
         context->have_first_slice = false;
@@ -1184,6 +1209,8 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
     }
     context->target = target_id;
     context->slice_size = 0;
+    context->h264_packet_size = 0;
+    context->have_h264_packet = false;
     context->pending_slice_count = 0;
     context->have_picture = false;
     context->have_first_slice = false;
@@ -1278,6 +1305,28 @@ static VAStatus render_av1_buffer(struct va_context *context,
     return VA_STATUS_SUCCESS;
 }
 
+static VAStatus render_h264_packet(struct va_context *context,
+                                   const struct va_buffer *buffer) {
+    size_t bytes = (size_t)buffer->size * buffer->elements;
+    if (buffer->elements != 1 || bytes < sizeof(struct fma_va_packet_header) ||
+        context->have_h264_packet)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    const struct fma_va_packet_header *header = buffer->data;
+    if (header->magic != FMA_VA_PACKET_MAGIC ||
+        header->version != FMA_VA_PACKET_VERSION ||
+        header->codec != FMA_CODEC_H264 || header->flags ||
+        header->payload_size != bytes - sizeof(*header) ||
+        !header->payload_size || header->payload_size > FMA_MAX_PAYLOAD)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!append_data(&context->h264_packet, &context->h264_packet_size,
+                     &context->h264_packet_capacity, header + 1,
+                     header->payload_size))
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    context->have_h264_packet = true;
+    context->have_first_slice = true;
+    return VA_STATUS_SUCCESS;
+}
+
 static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
                                VABufferID *ids, int count) {
     struct va_driver *driver = ctx->pDriverData;
@@ -1303,6 +1352,12 @@ static VAStatus render_picture(VADriverContextP ctx, VAContextID context_id,
         }
         if (codec == FMA_CODEC_AV1) {
             VAStatus status = render_av1_buffer(context, buffer);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+            continue;
+        }
+        if ((unsigned)buffer->type == FMA_VA_PACKET_BUFFER_TYPE) {
+            VAStatus status = render_h264_packet(context, buffer);
             if (status != VA_STATUS_SUCCESS)
                 return status;
             continue;
@@ -1403,22 +1458,30 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
     uint32_t packet_flags = 0;
     bool expects_output = true;
     if (codec == FMA_CODEC_H264) {
-        enum fma_h264_build_status build_status = fma_h264_build_packet(
-            config->profile, &context->picture,
-            context->have_iq_matrix ? &context->iq_matrix : NULL,
-            &context->first_slice, context->slices, context->slice_size,
-            &owned_packet, &packet_size);
-        if (build_status != FMA_H264_BUILD_OK) {
-            if (debug_enabled())
-                fprintf(stderr,
-                        "fma-va: H264 packet build failed status=%d\n",
-                        build_status);
-            free(owned_packet);
-            return VA_STATUS_ERROR_DECODING_ERROR;
+        unsigned nal_type = 0;
+        if (context->have_h264_packet) {
+            packet = context->h264_packet;
+            packet_size = context->h264_packet_size;
+            nal_type = h264_first_vcl_nal_type(packet, packet_size);
+            if (!nal_type)
+                return VA_STATUS_ERROR_DECODING_ERROR;
+        } else {
+            enum fma_h264_build_status build_status = fma_h264_build_packet(
+                config->profile, &context->picture,
+                context->have_iq_matrix ? &context->iq_matrix : NULL,
+                &context->first_slice, context->slices, context->slice_size,
+                &owned_packet, &packet_size);
+            if (build_status != FMA_H264_BUILD_OK) {
+                if (debug_enabled())
+                    fprintf(stderr,
+                            "fma-va: H264 packet build failed status=%d\n",
+                            build_status);
+                free(owned_packet);
+                return VA_STATUS_ERROR_DECODING_ERROR;
+            }
+            packet = owned_packet;
+            nal_type = context->slice_size ? context->slices[0] & 0x1fu : 0;
         }
-        packet = owned_packet;
-        unsigned nal_type =
-            context->slice_size ? context->slices[0] & 0x1fu : 0;
         pts_us = fma_h264_picture_pts(
             &context->timeline, context->picture.CurrPic.TopFieldOrderCnt,
             nal_type == 5);

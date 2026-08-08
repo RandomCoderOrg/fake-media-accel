@@ -38,12 +38,13 @@ software=$work/software.checksums
 hardware=$work/hardware.checksums
 hardware_log=$work/hardware.log
 
-"$ffmpeg" -hide_banner -i "$input" -vf format=nv12,showinfo \
+"$ffmpeg" -hide_banner -nostats -i "$input" -vf format=nv12,showinfo \
     -f rawvideo -y /dev/null 2>&1 | sed -n \
     's/.*s:\([0-9][0-9]*x[0-9][0-9]*\).*plane_checksum:\[\([^]]*\)\].*/\1 \2/p' \
     > "$software"
 
-FMA_VA_METRICS=1 "$ffmpeg" -hide_banner -vaapi_device "$va_device" \
+FMA_VA_METRICS=1 "$ffmpeg" -hide_banner -nostats \
+    -vaapi_device "$va_device" \
     -hwaccel vaapi -hwaccel_output_format vaapi -i "$input" \
     -vf hwdownload,format=nv12,showinfo -f rawvideo -y /dev/null \
     >/dev/null 2>"$hardware_log"

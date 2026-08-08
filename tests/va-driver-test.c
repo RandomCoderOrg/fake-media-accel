@@ -127,7 +127,7 @@ int main(void) {
               &expected_multi_packet, &expected_multi_packet_size) ==
           FMA_H264_BUILD_OK);
 
-    VABufferID buffers[6];
+    VABufferID buffers[7];
     CHECK(table.vaCreateBuffer(&context, decoder,
                                VAPictureParameterBufferType, sizeof(picture),
                                1, &picture, &buffers[0]) == VA_STATUS_SUCCESS);
@@ -179,6 +179,7 @@ int main(void) {
     picture.frame_num = 1;
     picture.CurrPic.TopFieldOrderCnt = 2;
     picture.CurrPic.BottomFieldOrderCnt = 2;
+    picture.seq_fields.bits.pic_order_cnt_type = 1;
     VAPictureParameterBufferH264 *mapped_picture = NULL;
     CHECK(table.vaMapBuffer(&context, buffers[0],
                             (void **)&mapped_picture) == VA_STATUS_SUCCESS);
@@ -194,12 +195,40 @@ int main(void) {
           VA_STATUS_SUCCESS);
     mapped_slice->slice_data_flag = VA_SLICE_DATA_FLAG_END;
     CHECK(table.vaUnmapBuffer(&context, buffers[4]) == VA_STATUS_SUCCESS);
+    uint8_t private_h264[sizeof(struct fma_va_packet_header) +
+                         sizeof(expected_packet)];
+    struct fma_va_packet_header private_h264_header = {
+        .magic = FMA_VA_PACKET_MAGIC,
+        .version = FMA_VA_PACKET_VERSION,
+        .codec = FMA_CODEC_H264,
+        .payload_size = sizeof(expected_packet),
+    };
+    memcpy(private_h264, &private_h264_header, sizeof(private_h264_header));
+    memcpy(private_h264 + sizeof(private_h264_header), expected_packet,
+           sizeof(expected_packet));
+    CHECK(table.vaCreateBuffer(&context, decoder,
+                               (VABufferType)FMA_VA_PACKET_BUFFER_TYPE,
+                               sizeof(private_h264), 1, private_h264,
+                               &buffers[6]) == VA_STATUS_SUCCESS);
+    const char *private_dump_path = "/tmp/fma-va-driver-test-private.h264";
+    (void)remove(private_dump_path);
+    CHECK(setenv("FMA_VA_DUMP", private_dump_path, 1) == 0);
     CHECK(table.vaBeginPicture(&context, decoder, surfaces[0]) ==
           VA_STATUS_SUCCESS);
-    CHECK(table.vaRenderPicture(&context, decoder, buffers, 6) ==
+    CHECK(table.vaRenderPicture(&context, decoder, buffers, 7) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaEndPicture(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaSyncSurface(&context, surfaces[0]) == VA_STATUS_SUCCESS);
+    dump = fopen(private_dump_path, "rb");
+    CHECK(dump != NULL);
+    uint8_t private_dumped[sizeof(expected_packet)];
+    CHECK(fread(private_dumped, 1, sizeof(private_dumped), dump) ==
+          sizeof(private_dumped));
+    CHECK(fgetc(dump) == EOF && fclose(dump) == 0);
+    CHECK(memcmp(private_dumped, expected_packet,
+                 sizeof(private_dumped)) == 0);
+    CHECK(remove(private_dump_path) == 0);
+    CHECK(unsetenv("FMA_VA_DUMP") == 0);
 
     VAImage image;
     CHECK(table.vaDeriveImage(&context, surfaces[0], &image) ==
@@ -211,7 +240,7 @@ int main(void) {
     CHECK(table.vaUnmapBuffer(&context, image.buf) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyImage(&context, image.image_id) == VA_STATUS_SUCCESS);
 
-    for (unsigned i = 0; i < 6; ++i)
+    for (unsigned i = 0; i < 7; ++i)
         CHECK(table.vaDestroyBuffer(&context, buffers[i]) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyContext(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroySurfaces(&context, surfaces, 2) == VA_STATUS_SUCCESS);

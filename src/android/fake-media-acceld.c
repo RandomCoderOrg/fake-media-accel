@@ -334,6 +334,7 @@ static int create_decoder(struct decoder_session *session,
     session->input_chunk_limit = (uint32_t)max_input_size();
     AMediaFormat_setInt32(session->format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
                           (int32_t)session->input_chunk_limit);
+    AMediaFormat_setInt32(session->format, "low-latency", 1);
     if (AMediaCodec_configure(session->codec, session->format, window, NULL, 0) !=
             AMEDIA_OK ||
         AMediaCodec_start(session->codec) != AMEDIA_OK)
