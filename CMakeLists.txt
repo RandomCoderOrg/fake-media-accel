@@ -5,6 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
+find_package(Threads REQUIRED)
 
 add_library(fma-common STATIC
     src/common/av1_obu.c
@@ -33,10 +34,11 @@ target_link_libraries(fma-ivf-inspect PRIVATE fma-common)
 
 if(ANDROID)
     add_executable(fake-media-acceld src/android/fake-media-acceld.c)
-    target_link_libraries(fake-media-acceld PRIVATE fma-common mediandk android log)
+    target_link_libraries(fake-media-acceld PRIVATE
+        fma-common mediandk android log Threads::Threads)
 else()
     add_executable(fake-media-acceld src/fake/fake-media-acceld.c)
-    target_link_libraries(fake-media-acceld PRIVATE fma-common)
+    target_link_libraries(fake-media-acceld PRIVATE fma-common Threads::Threads)
 
     include(GNUInstallDirs)
     find_package(PkgConfig QUIET)
@@ -49,7 +51,6 @@ else()
         pkg_check_modules(X11 QUIET IMPORTED_TARGET x11)
     endif()
     if(LIBVA_FOUND)
-        find_package(Threads REQUIRED)
         add_library(fma-va-driver SHARED
             src/va/fma_drv_video.c
             src/va/h264_annexb.c
@@ -104,10 +105,19 @@ else()
         target_link_libraries(fma-ivf-test PRIVATE fma-common)
         add_executable(fma-av1-obu-test tests/av1-obu-test.c)
         target_link_libraries(fma-av1-obu-test PRIVATE fma-common)
+        add_executable(fma-client-concurrency-test
+            tests/client-concurrency-test.c)
+        target_link_libraries(fma-client-concurrency-test PRIVATE fma-client)
         add_test(NAME protocol COMMAND fma-protocol-test)
         add_test(NAME h264-stream COMMAND fma-h264-stream-test)
         add_test(NAME ivf COMMAND fma-ivf-test)
         add_test(NAME av1-obu COMMAND fma-av1-obu-test)
+        add_test(NAME fake-concurrent-clients
+            COMMAND sh ${CMAKE_SOURCE_DIR}/tests/fake-concurrent.sh
+                $<TARGET_FILE:fake-media-acceld>
+                $<TARGET_FILE:fma-client-concurrency-test>
+                ${CMAKE_BINARY_DIR}/fake-concurrent.sock)
+        set_tests_properties(fake-concurrent-clients PROPERTIES TIMEOUT 5)
         add_test(NAME fake-roundtrip
             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/fake-roundtrip.sh
                 $<TARGET_FILE:fake-media-acceld>

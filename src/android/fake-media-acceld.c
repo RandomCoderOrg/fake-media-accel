@@ -12,6 +12,7 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -43,6 +44,7 @@ struct dma_buf_sync {
 #endif
 
 #define FMA_MAX_OUTPUT_TARGETS 64u
+#define FMA_MAX_CLIENTS 8u
 
 struct output_target {
     bool used;
@@ -81,6 +83,12 @@ struct decoder_session {
 };
 
 static volatile sig_atomic_t running = 1;
+static pthread_mutex_t client_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned client_count;
+
+struct client_worker {
+    int fd;
+};
 
 static uint64_t monotonic_ns(void) {
     struct timespec time;
@@ -447,7 +455,9 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
             }
         }
     }
-    for (int32_t y = 0; y < height / 2; ++y) {
+    int32_t chroma_height = (height + 1) / 2;
+    int32_t chroma_width = (width + 1) / 2;
+    for (int32_t y = 0; y < chroma_height; ++y) {
         size_t u_row = (size_t)(crop.top / 2 + y) * row_stride[1] +
                        (size_t)(crop.left / 2) * pixel_stride[1];
         size_t v_row = (size_t)(crop.top / 2 + y) * row_stride[2] +
@@ -471,7 +481,7 @@ static int copy_image_to_nv12(AImage *image, struct decoder_session *session,
             destination[destination_row + prefix] = plane_data[2][last_v];
             continue;
         }
-        for (int32_t x = 0; x < width / 2; ++x) {
+        for (int32_t x = 0; x < chroma_width; ++x) {
             size_t u = u_row + (size_t)x * pixel_stride[1];
             size_t v = v_row + (size_t)x * pixel_stride[2];
             if (u >= (size_t)plane_length[1] || v >= (size_t)plane_length[2])
@@ -839,6 +849,34 @@ static int serve_client(int fd) {
     return result;
 }
 
+static bool reserve_client_slot(void) {
+    bool reserved = false;
+    pthread_mutex_lock(&client_count_lock);
+    if (client_count < FMA_MAX_CLIENTS) {
+        ++client_count;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&client_count_lock);
+    return reserved;
+}
+
+static void release_client_slot(void) {
+    pthread_mutex_lock(&client_count_lock);
+    if (client_count)
+        --client_count;
+    pthread_mutex_unlock(&client_count_lock);
+}
+
+static void *serve_client_thread(void *opaque) {
+    struct client_worker *worker = opaque;
+    int fd = worker->fd;
+    free(worker);
+    (void)serve_client(fd);
+    close(fd);
+    release_client_slot();
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *socket_path = argc == 2 ? argv[1] : "@fake-media-accel";
     if (start_binder_thread_pool() < 0)
@@ -850,7 +888,7 @@ int main(int argc, char **argv) {
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
-    int server = fma_listen_unix(socket_path, 4);
+    int server = fma_listen_unix(socket_path, FMA_MAX_CLIENTS);
     if (server < 0) {
         perror("listen");
         return 1;
@@ -866,8 +904,25 @@ int main(int argc, char **argv) {
                 continue;
             break;
         }
-        (void)serve_client(client);
-        close(client);
+        if (!reserve_client_slot()) {
+            close(client);
+            continue;
+        }
+        struct client_worker *worker = malloc(sizeof(*worker));
+        if (!worker) {
+            close(client);
+            release_client_slot();
+            continue;
+        }
+        worker->fd = client;
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, serve_client_thread, worker) != 0) {
+            free(worker);
+            close(client);
+            release_client_slot();
+            continue;
+        }
+        pthread_detach(thread);
     }
     close(server);
     if (socket_path[0] != '@')

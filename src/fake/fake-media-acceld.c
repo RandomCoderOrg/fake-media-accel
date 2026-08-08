@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,6 +14,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define FMA_MAX_CLIENTS 8u
 
 struct fake_session {
     uint64_t id;
@@ -29,6 +32,12 @@ struct fake_session {
 };
 
 static volatile sig_atomic_t running = 1;
+static pthread_mutex_t client_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned client_count;
+
+struct client_worker {
+    int fd;
+};
 
 static void on_signal(int signal_number) {
     (void)signal_number;
@@ -101,7 +110,8 @@ static int create_pool(struct fake_session *session,
         .height = config->height,
         .stride = stride,
         .slot_count = config->slot_count,
-        .slot_size = stride * config->height * 3u / 2u,
+        .slot_size = stride *
+            (config->height + (config->height + 1u) / 2u),
     };
     session->pool_bytes = (size_t)session->pool.slot_size * session->pool.slot_count;
     if (session->pool_bytes > FMA_MAX_POOL_BYTES) {
@@ -154,7 +164,8 @@ found:
         memset(pixels + (size_t)y * session->pool.stride,
                (uint8_t)(16 + request->request_id % 220), session->pool.width);
     uint8_t *uv = pixels + (size_t)session->pool.stride * session->pool.height;
-    memset(uv, 128, (size_t)session->pool.stride * session->pool.height / 2);
+    memset(uv, 128, (size_t)session->pool.stride *
+                    ((session->pool.height + 1u) / 2u));
     if (direct_output)
         munmap(pixels, session->pool.slot_size);
 
@@ -323,6 +334,34 @@ static int handle_client(int fd) {
     return result;
 }
 
+static bool reserve_client_slot(void) {
+    bool reserved = false;
+    pthread_mutex_lock(&client_count_lock);
+    if (client_count < FMA_MAX_CLIENTS) {
+        ++client_count;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&client_count_lock);
+    return reserved;
+}
+
+static void release_client_slot(void) {
+    pthread_mutex_lock(&client_count_lock);
+    if (client_count)
+        --client_count;
+    pthread_mutex_unlock(&client_count_lock);
+}
+
+static void *handle_client_thread(void *opaque) {
+    struct client_worker *worker = opaque;
+    int fd = worker->fd;
+    free(worker);
+    (void)handle_client(fd);
+    close(fd);
+    release_client_slot();
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *socket_path = argc >= 2 ? argv[1] : "/tmp/fake-media-accel.sock";
     bool once = argc >= 3 && strcmp(argv[2], "--once") == 0;
@@ -332,7 +371,7 @@ int main(int argc, char **argv) {
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
-    int server = fma_listen_unix(socket_path, 4);
+    int server = fma_listen_unix(socket_path, FMA_MAX_CLIENTS);
     if (server < 0) {
         perror("listen");
         return 1;
@@ -347,10 +386,30 @@ int main(int argc, char **argv) {
             perror("accept");
             break;
         }
-        (void)handle_client(client);
-        close(client);
-        if (once)
+        if (once) {
+            (void)handle_client(client);
+            close(client);
             break;
+        }
+        if (!reserve_client_slot()) {
+            close(client);
+            continue;
+        }
+        struct client_worker *worker = malloc(sizeof(*worker));
+        if (!worker) {
+            close(client);
+            release_client_slot();
+            continue;
+        }
+        worker->fd = client;
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, handle_client_thread, worker) != 0) {
+            free(worker);
+            close(client);
+            release_client_slot();
+            continue;
+        }
+        pthread_detach(thread);
     }
     close(server);
     unlink(socket_path);
