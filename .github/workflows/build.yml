@@ -20,6 +20,9 @@ jobs:
           sh -n tools/fma-vlc-benchmark.sh
           sh -n tools/fma-ffplay-benchmark.sh
           sh -n tools/fma-ffplay-lifecycle.sh
+          sh -n tools/fma-ffplay-soak.sh
+          sh -n tools/fma-ffmpeg-verify-dynamic.sh
+          sh -n tools/fma-nv12-verify-dynamic.sh
           python3 -m py_compile tools/fma-measure.py
           tools/fma-measure.py /tmp/fma-measure.txt 5 true
           grep -q '^timed_out=0$' /tmp/fma-measure.txt
