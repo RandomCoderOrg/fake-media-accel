@@ -32,21 +32,32 @@ for command in "$ffmpeg" sed cmp diff mktemp wc tail tr; do
     }
 done
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/fma-ffmpeg-verify.XXXXXX")
-trap 'rm -rf "$work"' EXIT INT TERM
+if [ -n "${FMA_VERIFY_WORK:-}" ]; then
+    work=$FMA_VERIFY_WORK
+    mkdir -p "$work"
+    rm -f "$work/software.checksums" "$work/hardware.checksums" \
+        "$work/software.log" "$work/hardware.log"
+else
+    work=$(mktemp -d "${TMPDIR:-/tmp}/fma-ffmpeg-verify.XXXXXX")
+    trap 'rm -rf "$work"' EXIT INT TERM
+fi
 software=$work/software.checksums
 hardware=$work/hardware.checksums
+software_log=$work/software.log
 hardware_log=$work/hardware.log
 
 "$ffmpeg" -hide_banner -nostats -i "$input" -vf format=nv12,showinfo \
-    -f rawvideo -y /dev/null 2>&1 | sed -n \
+    -fps_mode passthrough -f rawvideo -y /dev/null \
+    >/dev/null 2>"$software_log"
+sed -n \
     's/.*s:\([0-9][0-9]*x[0-9][0-9]*\).*plane_checksum:\[\([^]]*\)\].*/\1 \2/p' \
-    > "$software"
+    "$software_log" > "$software"
 
 FMA_VA_METRICS=1 "$ffmpeg" -hide_banner -nostats \
     -vaapi_device "$va_device" \
     -hwaccel vaapi -hwaccel_output_format vaapi -i "$input" \
-    -vf hwdownload,format=nv12,showinfo -f rawvideo -y /dev/null \
+    -vf hwdownload,format=nv12,showinfo -fps_mode passthrough \
+    -f rawvideo -y /dev/null \
     >/dev/null 2>"$hardware_log"
 sed -n \
     's/.*s:\([0-9][0-9]*x[0-9][0-9]*\).*plane_checksum:\[\([^]]*\)\].*/\1 \2/p' \

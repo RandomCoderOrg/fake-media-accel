@@ -1,4 +1,5 @@
 /build/
+/build-current/
 /build-va/
 /build-android-*/
 *.raw

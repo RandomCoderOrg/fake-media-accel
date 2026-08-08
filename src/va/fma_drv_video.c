@@ -174,6 +174,8 @@ struct va_driver {
     uint64_t contexts_destroyed;
     uint64_t context_destroy_ns;
     uint64_t contexts_reused;
+    uint64_t surfaces_reallocated;
+    uint64_t surface_reallocation_ns;
     uint64_t submitted_frames;
     uint64_t submission_ns;
     uint64_t stored_frames;
@@ -387,6 +389,94 @@ static void release_surface(struct va_surface *surface) {
         free(surface->data);
     }
     memset(surface, 0, sizeof(*surface));
+}
+
+static bool allocate_surface_backing(struct va_surface *surface) {
+    surface->dma_buf_fd = allocate_dma_buf(surface->size);
+    if (surface->dma_buf_fd >= 0) {
+        surface->data = mmap(NULL, surface->size, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, surface->dma_buf_fd, 0);
+        if (surface->data != MAP_FAILED &&
+            begin_surface_cpu_access(surface, DMA_BUF_SYNC_WRITE)) {
+            memset(surface->data, 0, surface->size);
+            if (end_surface_cpu_access(surface, DMA_BUF_SYNC_WRITE))
+                return true;
+        }
+        if (surface->data && surface->data != MAP_FAILED)
+            munmap(surface->data, surface->size);
+        close(surface->dma_buf_fd);
+        surface->data = NULL;
+        surface->dma_buf_fd = -1;
+    }
+    surface->data = calloc(1, surface->size);
+    return surface->data != NULL;
+}
+
+static bool initialize_surface(struct va_surface *surface, unsigned width,
+                               unsigned height, unsigned stride,
+                               unsigned allocation_height,
+                               size_t minimum_size) {
+    size_t uv_offset;
+    size_t bytes;
+    if (!nv12_layout(width, allocation_height, stride, &uv_offset, &bytes))
+        return false;
+    if (bytes < minimum_size)
+        bytes = minimum_size;
+    *surface = (struct va_surface) {
+        .used = true, .width = width, .height = height,
+        .allocation_height = allocation_height, .stride = stride,
+        .uv_offset = uv_offset, .size = bytes, .dma_buf_fd = -1,
+        .pts_us = -1, .status = VASurfaceReady,
+    };
+    if (allocate_surface_backing(surface))
+        return true;
+    memset(surface, 0, sizeof(*surface));
+    return false;
+}
+
+static bool reallocate_surface(struct va_surface *surface, unsigned stride,
+                               unsigned allocation_height,
+                               size_t minimum_size) {
+    if (surface->stride == stride &&
+        surface->allocation_height == allocation_height &&
+        surface->size >= minimum_size)
+        return true;
+    if (surface->derived_images || surface->external_handles)
+        return false;
+    struct va_surface replacement;
+    if (!initialize_surface(&replacement, surface->width, surface->height,
+                            stride, allocation_height, minimum_size))
+        return false;
+    release_surface(surface);
+    *surface = replacement;
+    return true;
+}
+
+static VAStatus align_surface_to_context(struct va_driver *driver,
+                                         struct va_context *context,
+                                         struct va_surface *surface) {
+    bool needs_reallocation =
+        surface->stride != context->pool.stride ||
+        surface->allocation_height != context->pool.height ||
+        surface->size < context->pool.slot_size;
+    if (!needs_reallocation)
+        return VA_STATUS_SUCCESS;
+    if (surface->derived_images || surface->external_handles)
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    uint64_t started_ns = monotonic_ns();
+    if (!reallocate_surface(surface, context->pool.stride,
+                            context->pool.height, context->pool.slot_size))
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    driver->surfaces_reallocated++;
+    driver->surface_reallocation_ns += monotonic_ns() - started_ns;
+    if (debug_enabled())
+        fprintf(stderr,
+                "fma-va: realigned surface visible=%ux%u storage=%ux%u "
+                "bytes=%zu duration_ms=%.3f\n",
+                surface->width, surface->height, surface->stride,
+                surface->allocation_height, surface->size,
+                (double)(monotonic_ns() - started_ns) / 1000000.0);
+    return VA_STATUS_SUCCESS;
 }
 
 static uint32_t codec_for_profile(VAProfile profile) {
@@ -623,6 +713,7 @@ static VAStatus terminate(VADriverContextP ctx) {
         fprintf(stderr,
                 "fma-va-metrics contexts_created=%llu create_ms=%.3f "
                 "contexts_destroyed=%llu destroy_ms=%.3f reused=%llu "
+                "surfaces_reallocated=%llu reallocation_ms=%.3f "
                 "submitted=%llu submission_ms=%.3f "
                 "stored=%llu direct=%llu store_copy_mib=%.3f "
                 "store_copy_ms=%.3f "
@@ -635,6 +726,8 @@ static VAStatus terminate(VADriverContextP ctx) {
                 (unsigned long long)driver->contexts_destroyed,
                 (double)driver->context_destroy_ns / 1000000.0,
                 (unsigned long long)driver->contexts_reused,
+                (unsigned long long)driver->surfaces_reallocated,
+                (double)driver->surface_reallocation_ns / 1000000.0,
                 (unsigned long long)driver->submitted_frames,
                 (double)driver->submission_ns / 1000000.0,
                 (unsigned long long)driver->stored_frames,
@@ -780,52 +873,22 @@ static VAStatus create_surfaces(VADriverContextP ctx, int width, int height,
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     unsigned stride = ((unsigned)width + 63u) & ~63u;
     unsigned allocation_height = ((unsigned)height + 15u) & ~15u;
-    size_t uv_offset;
-    size_t bytes;
-    if (!nv12_layout((unsigned)width, allocation_height, stride, &uv_offset,
-                     &bytes))
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
     int created = 0;
     for (unsigned i = 0; i < FMA_VA_MAX_SURFACES && created < count; ++i) {
         if (driver->surfaces[i].used)
             continue;
-        struct va_surface surface = {
-            .used = true, .width = (unsigned)width,
-            .height = (unsigned)height,
-            .allocation_height = allocation_height,
-            .stride = stride, .uv_offset = uv_offset, .size = bytes,
-            .dma_buf_fd = -1, .pts_us = -1, .status = VASurfaceReady,
-        };
-        surface.dma_buf_fd = allocate_dma_buf(bytes);
-        if (surface.dma_buf_fd >= 0) {
-            surface.data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
-                                surface.dma_buf_fd, 0);
-            if (surface.data == MAP_FAILED ||
-                !begin_surface_cpu_access(&surface, DMA_BUF_SYNC_WRITE)) {
-                if (surface.data == MAP_FAILED)
-                    surface.data = NULL;
-                release_surface(&surface);
-                surface.dma_buf_fd = -1;
-            } else {
-                memset(surface.data, 0, bytes);
-                if (!end_surface_cpu_access(&surface, DMA_BUF_SYNC_WRITE)) {
-                    release_surface(&surface);
-                    surface.dma_buf_fd = -1;
-                }
-            }
-        }
-        if (surface.dma_buf_fd < 0) {
-            surface.data = calloc(1, bytes);
-            if (!surface.data)
-                break;
-        }
+        struct va_surface surface;
+        if (!initialize_surface(&surface, (unsigned)width, (unsigned)height,
+                                stride, allocation_height, 0))
+            break;
         if (debug_enabled())
             fprintf(stderr,
                     "fma-va: surface %ux%u storage=%ux%u backing=%s "
                     "bytes=%zu\n",
                     surface.width, surface.height, surface.stride,
                     surface.allocation_height,
-                    surface.dma_buf_fd >= 0 ? "dma-buf" : "malloc", bytes);
+                    surface.dma_buf_fd >= 0 ? "dma-buf" : "malloc",
+                    surface.size);
         driver->surfaces[i] = surface;
         ids[created++] = i + 1;
     }
@@ -883,6 +946,14 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
             (unsigned)width > context->decoder_width ||
             (unsigned)height > context->decoder_height)
             continue;
+        for (int target = 0; target < target_count; ++target) {
+            struct va_surface *surface =
+                get_surface(driver, targets[target]);
+            VAStatus status =
+                align_surface_to_context(driver, context, surface);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+        }
         context->retired = false;
         context->needs_stream_reset = true;
         context->config_id = config_id;
@@ -1207,6 +1278,10 @@ static VAStatus begin_picture(VADriverContextP ctx, VAContextID context_id,
         if (status != VA_STATUS_SUCCESS)
             return status;
     }
+    VAStatus alignment_status =
+        align_surface_to_context(driver, context, surface);
+    if (alignment_status != VA_STATUS_SUCCESS)
+        return alignment_status;
     context->target = target_id;
     context->slice_size = 0;
     context->h264_packet_size = 0;

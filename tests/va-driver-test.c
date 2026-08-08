@@ -253,6 +253,14 @@ int main(void) {
                                 resized_surfaces, 2, &resized_decoder) ==
           VA_STATUS_SUCCESS);
     CHECK(resized_decoder == decoder);
+    VAImage resized_image;
+    CHECK(table.vaDeriveImage(&context, resized_surfaces[0], &resized_image) ==
+          VA_STATUS_SUCCESS);
+    CHECK(resized_image.width == 32 && resized_image.height == 33);
+    CHECK(resized_image.pitches[0] == 64 && resized_image.offsets[1] == 4096);
+    CHECK(resized_image.data_size == 6144);
+    CHECK(table.vaDestroyImage(&context, resized_image.image_id) ==
+          VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyContext(&context, resized_decoder) ==
           VA_STATUS_SUCCESS);
     CHECK(table.vaDestroySurfaces(&context, resized_surfaces, 2) ==
@@ -288,7 +296,7 @@ int main(void) {
     vp9_slice.slice_data_offset = 2;
     vp9_slice.slice_data_size = sizeof(expected_vp9_packet);
     vp9_slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
-    VABufferID vp9_buffers[3];
+    VABufferID vp9_buffers[4];
     CHECK(table.vaCreateBuffer(&context, vp9_decoder,
                                VAPictureParameterBufferType,
                                sizeof(vp9_picture), 1, &vp9_picture,
@@ -321,7 +329,62 @@ int main(void) {
                  sizeof(vp9_dumped)) == 0);
     CHECK(remove(vp9_dump_path) == 0);
     CHECK(unsetenv("FMA_VA_DUMP") == 0);
-    for (unsigned i = 0; i < 3; ++i)
+
+    VASliceParameterBufferVP9 *mapped_vp9_slice = NULL;
+    CHECK(table.vaMapBuffer(&context, vp9_buffers[1],
+                            (void **)&mapped_vp9_slice) == VA_STATUS_SUCCESS);
+    mapped_vp9_slice->slice_data_size = 2;
+    mapped_vp9_slice->slice_data_flag = VA_SLICE_DATA_FLAG_BEGIN;
+    CHECK(table.vaUnmapBuffer(&context, vp9_buffers[1]) == VA_STATUS_SUCCESS);
+    VASliceParameterBufferVP9 vp9_slice_end = vp9_slice;
+    vp9_slice_end.slice_data_offset = 4;
+    vp9_slice_end.slice_data_size = 2;
+    vp9_slice_end.slice_data_flag = VA_SLICE_DATA_FLAG_END;
+    CHECK(table.vaCreateBuffer(&context, vp9_decoder,
+                               VASliceParameterBufferType,
+                               sizeof(vp9_slice_end), 1, &vp9_slice_end,
+                               &vp9_buffers[3]) == VA_STATUS_SUCCESS);
+    VABufferID vp9_fragment_buffers[] = {
+        vp9_buffers[0], vp9_buffers[1], vp9_buffers[2],
+        vp9_buffers[3], vp9_buffers[2],
+    };
+    const char *vp9_fragment_dump_path =
+        "/tmp/fma-va-driver-test-fragmented.vp9";
+    (void)remove(vp9_fragment_dump_path);
+    CHECK(setenv("FMA_VA_DUMP", vp9_fragment_dump_path, 1) == 0);
+    CHECK(table.vaBeginPicture(&context, vp9_decoder, vp9_surfaces[1]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, vp9_decoder, vp9_fragment_buffers,
+                                sizeof(vp9_fragment_buffers) /
+                                    sizeof(vp9_fragment_buffers[0])) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaEndPicture(&context, vp9_decoder) == VA_STATUS_SUCCESS);
+    CHECK(table.vaSyncSurface(&context, vp9_surfaces[1]) == VA_STATUS_SUCCESS);
+    dump = fopen(vp9_fragment_dump_path, "rb");
+    CHECK(dump != NULL);
+    CHECK(fread(vp9_dumped, 1, sizeof(vp9_dumped), dump) ==
+          sizeof(vp9_dumped));
+    CHECK(fgetc(dump) == EOF && fclose(dump) == 0);
+    CHECK(memcmp(vp9_dumped, expected_vp9_packet,
+                 sizeof(vp9_dumped)) == 0);
+    CHECK(remove(vp9_fragment_dump_path) == 0);
+    CHECK(unsetenv("FMA_VA_DUMP") == 0);
+
+    CHECK(table.vaMapBuffer(&context, vp9_buffers[1],
+                            (void **)&mapped_vp9_slice) == VA_STATUS_SUCCESS);
+    mapped_vp9_slice->slice_data_flag = VA_SLICE_DATA_FLAG_MIDDLE;
+    CHECK(table.vaUnmapBuffer(&context, vp9_buffers[1]) == VA_STATUS_SUCCESS);
+    VABufferID vp9_invalid_buffers[] = {
+        vp9_buffers[0], vp9_buffers[1], vp9_buffers[2],
+    };
+    CHECK(table.vaBeginPicture(&context, vp9_decoder, vp9_surfaces[0]) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaRenderPicture(&context, vp9_decoder, vp9_invalid_buffers,
+                                sizeof(vp9_invalid_buffers) /
+                                    sizeof(vp9_invalid_buffers[0])) ==
+          VA_STATUS_ERROR_INVALID_PARAMETER);
+
+    for (unsigned i = 0; i < 4; ++i)
         CHECK(table.vaDestroyBuffer(&context, vp9_buffers[i]) ==
               VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyContext(&context, vp9_decoder) == VA_STATUS_SUCCESS);
