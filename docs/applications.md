@@ -213,7 +213,9 @@ three plane checksums. Both application paths are exact:
 The VP9 result includes the final chroma row at the odd 173-line height. The
 visible NV12 contract is `width * height + 2 * ceil(width/2) *
 ceil(height/2)`, rather than the even-dimension shortcut `width * height *
-3/2`.
+3/2`. Decode surfaces are realigned to the retained MediaCodec allocation when
+FFmpeg recreates a smaller VA context, so all ten outputs now remain direct;
+the three realignments cost 3.271 ms total in the app-domain probe.
 
 Use the application-level verifier with a full FFmpeg build that includes the
 `showinfo` filter:

@@ -64,6 +64,37 @@ dimensions are even and omitted the last chroma row at 282x173. FMA now uses
 output and VA image paths. All ten resize frames, including all three odd-height
 frames, now match FFmpeg software decode byte for byte.
 
+FFmpeg recreates its VA context and surfaces at both size transitions while
+FMA deliberately retains the larger stateful MediaCodec session. Initially the
+three 282x173 surfaces used their smaller 320x176 allocation and could not be
+registered as direct outputs for the retained 384x288 decoder pool. FMA now
+realigns a newly used VA surface to the active decoder pool in `vaBeginPicture`.
+Visible dimensions remain 282x173, but MediaCodec can write directly into every
+surface.
+
+| Dynamic-resize measurement | Before realignment | After realignment |
+| --- | ---: | ---: |
+| Exact frames | 10/10 | 10/10 |
+| Direct surfaces | 7/10 | 10/10 |
+| Driver surface-store copy | 0.209 MiB | 0 MiB |
+| Surface-reallocation cost | n/a | 3.271 ms total |
+
+```mermaid
+xychart-beta
+    title "VP9 dynamic-resize direct surfaces"
+    x-axis ["Before", "After"]
+    y-axis "Direct frames" 0 --> 10
+    bar [7, 10]
+```
+
+This result was reproduced through the real uDroid supervisor and app SELinux
+domain on a Pixel 6a. The 147,804-byte quantizer vector also remained exact and
+direct for both frames, and a 50-frame Gravity H.264 run remained 50/50 exact
+and direct after the shared allocation change. No decoded frame bytes crossed
+the Unix socket in these probes. MediaCodec still copies `AImage` output into
+the registered DMA-BUF; eliminating that Android-side copy is a separate
+AHardwareBuffer checkpoint.
+
 A forced 16 KiB MediaCodec input limit correctly rejects the 147,804-byte,
 two-packet quantizer sample before submitting an incomplete VP9 frame. Android's
 VP9 decoder does not accept MediaCodec partial-frame input reliably; the normal
