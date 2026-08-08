@@ -1,9 +1,10 @@
 # VA-API bridge status
 
 FMA exposes H.264, VP9 Profile 0 and AV1 Profile 0 MediaCodec decoding through
-a VA-API driver. H.264 and VP9 use ordinary VA decode buffers. AV1 additionally
-requires FMA's packet-preserving application adapter because the standard AV1
-VA structures do not contain a complete low-overhead OBU stream. On
+a VA-API driver. Representable H.264 and VP9 streams use ordinary VA decode
+buffers. H.264 POC type 1 and AV1 additionally use vendor-gated
+packet-preserving FFmpeg adapters because their standard VA structures omit
+codec state required by MediaCodec. On
 Android systems where `/dev/dma_heap/system` is accessible, decoded NV12
 surfaces are backed by linear DMA-BUFs and can be exported with
 `vaExportSurfaceHandle()` as `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`.
@@ -22,11 +23,16 @@ flowchart LR
 
 This route does not require a Termux:X11 patch. The X server is only one
 possible final consumer; FMA's contract ends at the standard DRM PRIME
-descriptor.
+descriptor. The codec bridge contains no Panfork, Mali or other GPU-driver
+dependency; a GPU-specific importer is an optional downstream presentation
+backend.
 
 ## Current contract
 
 - H.264 constrained-baseline, main and high profile decode.
+- Complete H.264 SPS/PPS/slice preservation for patched FFmpeg clients,
+  including POC type 1. The adapter preserves decode syntax while supplying a
+  zero-reorder decoder-facing VUI to avoid a VA/MediaCodec surface deadlock.
 - VP9 Profile 0, 8-bit 4:2:0 decode. The complete compressed VP9 frame supplied
   by libva is forwarded unchanged; Profile 2 is rejected because the current
   decoded-frame contract is NV12.

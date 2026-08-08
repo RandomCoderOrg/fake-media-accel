@@ -1,4 +1,4 @@
-# FFmpeg AV1 adapter
+# FFmpeg packet adapters
 
 The patches are deliberately split by responsibility:
 
@@ -12,6 +12,14 @@ The patches are deliberately split by responsibility:
   standalone VA-API device when its Vulkan renderer is unavailable. This is
   limited to explicitly requested VA-API decoding; other hardware-device types
   retain upstream behavior.
+- `0003-h264-preserve-fma-packets.patch` preserves FFmpeg's original H.264
+  SPS, PPS and escaped slice NAL units for the FMA driver. It replaces only the
+  decoder-facing VUI with a zero-reorder contract, preventing MediaCodec and a
+  synchronous VA surface pipeline from waiting on each other. The original
+  FFmpeg stream metadata remains unchanged. This carries POC type 1 offsets and
+  other SPS syntax that standard `VAPictureParameterBufferH264` omits. Like the
+  AV1 adapter, it is gated by the `fake-media-accel` vendor string and does not
+  change any other VA driver.
 
 The patches were built and tested at FFmpeg commit
 `5c395992f99feb47860e4cc99a0cea2009457870`:
@@ -20,7 +28,8 @@ The patches were built and tested at FFmpeg commit
 git -C /path/to/ffmpeg checkout 5c395992f99feb47860e4cc99a0cea2009457870
 git -C /path/to/ffmpeg apply \
   /path/to/fake-media-accel/patches/ffmpeg/0001-av1-preserve-fma-packets.patch \
-  /path/to/fake-media-accel/patches/ffmpeg/0002-ffplay-allow-filtered-vaapi-sdl-output.patch
+  /path/to/fake-media-accel/patches/ffmpeg/0002-ffplay-allow-filtered-vaapi-sdl-output.patch \
+  /path/to/fake-media-accel/patches/ffmpeg/0003-h264-preserve-fma-packets.patch
 ```
 
 Build FFmpeg with VA-API and the decoders, filters and applications required by

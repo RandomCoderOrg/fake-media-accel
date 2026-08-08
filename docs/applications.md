@@ -73,6 +73,12 @@ frame data crossed the Unix socket, and the VA driver performed no second
 presentation copy. This reduced total CPU by about 83 percent while preserving
 real-time pacing.
 
+The later packet-preserving FFmpeg checkpoint also decoded the complete
+146.980-second source rather than the smoke segment. All 3,524 visible High
+profile frames matched software plane checksums; all 3,525 decoded surfaces,
+including one FFmpeg-discarded preroll surface, used direct DMA-BUF output. See
+the [H.264 checkpoint](h264.md) for the full counters and the POC type 1 test.
+
 ## VP9 real-world checkpoint
 
 A Profile 0 WebM smoke stream was generated from the same local Gravity segment
