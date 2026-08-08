@@ -101,11 +101,17 @@ struct va_surface {
 
 struct va_context {
     bool used;
+    bool retired;
+    bool needs_stream_reset;
     bool io_lock_initialized;
     pthread_mutex_t io_lock;
     VAConfigID config_id;
     unsigned width;
     unsigned height;
+    unsigned decoder_width;
+    unsigned decoder_height;
+    uint32_t codec_id;
+    VAProfile profile;
     VASurfaceID target;
     struct fma_h264_timeline timeline;
     struct fma_client client;
@@ -128,6 +134,7 @@ struct va_context {
     bool slice_fragment_open;
     bool direct_output;
     uint64_t stored_frames;
+    uint64_t pending_outputs;
     uint64_t next_pts_us;
     VADecPictureParameterBufferVP9 vp9_picture;
     VASliceParameterBufferVP9 vp9_slice;
@@ -162,6 +169,7 @@ struct va_driver {
     uint64_t context_create_ns;
     uint64_t contexts_destroyed;
     uint64_t context_destroy_ns;
+    uint64_t contexts_reused;
     uint64_t submitted_frames;
     uint64_t submission_ns;
     uint64_t stored_frames;
@@ -235,7 +243,8 @@ static struct va_surface *get_surface(struct va_driver *driver,
 
 static struct va_context *get_context(struct va_driver *driver,
                                       VAContextID id) {
-    return id && id <= FMA_VA_MAX_CONTEXTS && driver->contexts[id - 1].used ?
+    return id && id <= FMA_VA_MAX_CONTEXTS &&
+        driver->contexts[id - 1].used && !driver->contexts[id - 1].retired ?
         &driver->contexts[id - 1] : NULL;
 }
 
@@ -475,7 +484,8 @@ static bool store_frame(struct va_driver *driver, struct va_context *context,
                 for (uint32_t row = 0; row < frame.height; ++row)
                     memcpy(surface->data + (size_t)row * surface->stride,
                            source + (size_t)row * frame.stride, frame.width);
-                for (uint32_t row = 0; row < frame.height / 2; ++row)
+                for (uint32_t row = 0;
+                     row < (frame.height + 1u) / 2u; ++row)
                     memcpy(surface->data + destination_y +
                                (size_t)row * surface->stride,
                            source + source_y + (size_t)row * frame.stride,
@@ -510,6 +520,8 @@ static bool store_frame(struct va_driver *driver, struct va_context *context,
         }
     }
     ++context->stored_frames;
+    if (context->pending_outputs)
+        --context->pending_outputs;
     if (debug_enabled()) {
         fprintf(stderr, "fma-va: frame pts=%lld slot=%u matched=%d\n",
                 (long long)message->pts_us, frame.slot, surface != NULL);
@@ -569,6 +581,17 @@ static bool process_until(struct va_driver *driver, struct va_context *context,
     }
 }
 
+static bool collect_pending_outputs(struct va_driver *driver,
+                                    struct va_context *context) {
+    for (unsigned attempt = 0;
+         context->pending_outputs && attempt < 20; ++attempt) {
+        if (fma_client_poll_output(&context->client, 50) < 0 ||
+            !process_until(driver, context, FMA_MSG_POLL_DONE))
+            return false;
+    }
+    return context->pending_outputs == 0;
+}
+
 static VAStatus terminate(VADriverContextP ctx) {
     struct va_driver *driver = ctx->pDriverData;
     if (!driver)
@@ -576,7 +599,7 @@ static VAStatus terminate(VADriverContextP ctx) {
     if (metrics_enabled())
         fprintf(stderr,
                 "fma-va-metrics contexts_created=%llu create_ms=%.3f "
-                "contexts_destroyed=%llu destroy_ms=%.3f "
+                "contexts_destroyed=%llu destroy_ms=%.3f reused=%llu "
                 "submitted=%llu submission_ms=%.3f "
                 "stored=%llu direct=%llu store_copy_mib=%.3f "
                 "store_copy_ms=%.3f "
@@ -588,6 +611,7 @@ static VAStatus terminate(VADriverContextP ctx) {
                 (double)driver->context_create_ns / 1000000.0,
                 (unsigned long long)driver->contexts_destroyed,
                 (double)driver->context_destroy_ns / 1000000.0,
+                (unsigned long long)driver->contexts_reused,
                 (unsigned long long)driver->submitted_frames,
                 (double)driver->submission_ns / 1000000.0,
                 (unsigned long long)driver->stored_frames,
@@ -829,6 +853,43 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
             return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     for (unsigned i = 0; i < FMA_VA_MAX_CONTEXTS; ++i) {
+        struct va_context *context = &driver->contexts[i];
+        if (!context->used || !context->retired ||
+            context->codec_id != codec ||
+            context->profile != va_config->profile ||
+            (unsigned)width > context->decoder_width ||
+            (unsigned)height > context->decoder_height)
+            continue;
+        context->retired = false;
+        context->needs_stream_reset = true;
+        context->config_id = config_id;
+        context->width = (unsigned)width;
+        context->height = (unsigned)height;
+        context->target = VA_INVALID_ID;
+        context->slice_size = 0;
+        context->pending_slice_count = 0;
+        context->have_picture = false;
+        context->have_first_slice = false;
+        context->have_iq_matrix = false;
+        context->have_vp9_slice = false;
+        context->have_av1_packet = false;
+        context->av1_packet_flags = 0;
+        context->slice_fragment_open = false;
+        *id = i + 1;
+        driver->contexts_created++;
+        driver->contexts_reused++;
+        driver->context_create_ns += monotonic_ns() - started_ns;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "fma-va: reused context=%u decoder=%ux%u visible=%dx%d "
+                    "duration_ms=%.3f elapsed_ms=%.3f\n",
+                    *id, context->decoder_width, context->decoder_height,
+                    width, height,
+                    (double)(monotonic_ns() - started_ns) / 1000000.0,
+                    driver_elapsed_ms(driver));
+        return VA_STATUS_SUCCESS;
+    }
+    for (unsigned i = 0; i < FMA_VA_MAX_CONTEXTS; ++i) {
         if (driver->contexts[i].used)
             continue;
         struct va_context *context = &driver->contexts[i];
@@ -866,6 +927,10 @@ static VAStatus create_context(VADriverContextP ctx, VAConfigID config_id,
         context->config_id = config_id;
         context->width = (unsigned)width;
         context->height = (unsigned)height;
+        context->decoder_width = (unsigned)width;
+        context->decoder_height = (unsigned)height;
+        context->codec_id = codec;
+        context->profile = va_config->profile;
         context->target = VA_INVALID_ID;
         *id = i + 1;
         driver->contexts_created++;
@@ -891,18 +956,28 @@ static VAStatus destroy_context(VADriverContextP ctx, VAContextID id) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     uint64_t started_ns = monotonic_ns();
     pthread_mutex_lock(&context->io_lock);
-    bool drained = fma_client_drain(&context->client) >= 0 &&
-        process_until(driver, context, FMA_MSG_OUTPUT_EOS);
+    bool collected = collect_pending_outputs(driver, context);
+    bool drained = false;
+    if (!collected)
+        drained = fma_client_drain(&context->client) >= 0 &&
+            process_until(driver, context, FMA_MSG_OUTPUT_EOS);
     pthread_mutex_unlock(&context->io_lock);
     driver->contexts_destroyed++;
     driver->context_destroy_ns += monotonic_ns() - started_ns;
     if (debug_enabled())
         fprintf(stderr,
-                "fma-va: destroy context drain=%d duration_ms=%.3f "
+                "fma-va: destroy context retire=%d drain=%d pending=%llu "
+                "duration_ms=%.3f "
                 "elapsed_ms=%.3f\n",
-                drained,
+                collected, drained,
+                (unsigned long long)context->pending_outputs,
                 (double)(monotonic_ns() - started_ns) / 1000000.0,
                 driver_elapsed_ms(driver));
+    if (collected) {
+        context->retired = true;
+        context->target = VA_INVALID_ID;
+        return VA_STATUS_SUCCESS;
+    }
     close_context(context);
     return drained ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
 }
@@ -1431,14 +1506,22 @@ static VAStatus end_picture(VADriverContextP ctx, VAContextID context_id) {
     dump_packet(packet, packet_size);
     uint64_t started_ns = monotonic_ns();
     pthread_mutex_lock(&context->io_lock);
+    bool reset = context->needs_stream_reset &&
+        (packet_flags & FMA_PACKET_KEY_FRAME);
+    bool reset_ok = !reset || fma_client_flush(&context->client) >= 0;
+    context->needs_stream_reset = false;
     bool direct_output = expects_output && context->direct_output &&
         surface->dma_buf_fd >= 0 &&
         surface->stride == context->pool.stride &&
         surface->allocation_height == context->pool.height &&
         surface->size >= context->pool.slot_size;
-    int sent = fma_client_queue_packet_to(
+    if (expects_output)
+        ++context->pending_outputs;
+    int sent = reset_ok ? fma_client_queue_packet_to(
         &context->client, packet, packet_size, pts_us, packet_flags,
-        direct_output ? surface->dma_buf_fd : -1);
+        direct_output ? surface->dma_buf_fd : -1) : -1;
+    if (sent < 0 && expects_output && context->pending_outputs)
+        --context->pending_outputs;
     free(owned_packet);
     bool processed = sent >= 0 &&
         process_until(driver, context, FMA_MSG_PACKET_ACK);
@@ -1687,7 +1770,6 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
     if (!buffer || !buffer->data ||
         (!planar && image->image.format.fourcc != VA_FOURCC_NV12) ||
         x < 0 || y < 0 || (x & 1) || (y & 1) ||
-        (width & 1) || (height & 1) ||
         (unsigned)x + width > surface->width ||
         (unsigned)y + height > surface->height ||
         width > image->image.width || height > image->image.height)
@@ -1728,20 +1810,23 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
                         (unsigned)x,
                     width);
         const uint8_t *source_uv = surface->data + surface->uv_offset;
-        for (unsigned row = 0; row < height / 2; ++row) {
+        unsigned chroma_rows = (height + 1u) / 2u;
+        unsigned chroma_columns = (width + 1u) / 2u;
+        unsigned chroma_bytes = chroma_columns * 2u;
+        for (unsigned row = 0; row < chroma_rows; ++row) {
             const uint8_t *source_row = source_uv +
                 ((unsigned)y / 2 + row) * surface->stride + (unsigned)x;
             if (!planar) {
                 memmove(destination + image->image.offsets[1] +
                             row * image->image.pitches[1],
-                        source_row, width);
+                        source_row, chroma_bytes);
                 continue;
             }
             uint8_t *destination_u = destination + image->image.offsets[1] +
                 row * image->image.pitches[1];
             uint8_t *destination_v = destination + image->image.offsets[2] +
                 row * image->image.pitches[2];
-            for (unsigned column = 0; column < width / 2; ++column) {
+            for (unsigned column = 0; column < chroma_columns; ++column) {
                 destination_u[column] = source_row[column * 2u];
                 destination_v[column] = source_row[column * 2u + 1u];
             }
@@ -1755,7 +1840,8 @@ static VAStatus get_image(VADriverContextP ctx, VASurfaceID surface_id,
             surface, same_surface ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ))
         synced = false;
     driver->get_image_calls++;
-    driver->get_image_bytes += (uint64_t)width * height * 3u / 2u;
+    driver->get_image_bytes += (uint64_t)width * height +
+        (uint64_t)((width + 1u) / 2u) * ((height + 1u) / 2u) * 2u;
     driver->get_image_ns += monotonic_ns() - started_ns;
     return synced ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
 }
@@ -1781,7 +1867,6 @@ static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_UNIMPLEMENTED;
     if (src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0 ||
         (src_x & 1) || (src_y & 1) || (dst_x & 1) || (dst_y & 1) ||
-        (src_width & 1) || (src_height & 1) ||
         (unsigned)src_x + src_width > image->image.width ||
         (unsigned)src_y + src_height > image->image.height ||
         (unsigned)dst_x + dst_width > surface->width ||
@@ -1813,7 +1898,10 @@ static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
                 src_width);
     uint8_t *destination_uv =
         surface->data + surface->uv_offset;
-    for (unsigned row = 0; row < src_height / 2; ++row) {
+    unsigned chroma_rows = (src_height + 1u) / 2u;
+    unsigned chroma_columns = (src_width + 1u) / 2u;
+    unsigned chroma_bytes = chroma_columns * 2u;
+    for (unsigned row = 0; row < chroma_rows; ++row) {
         uint8_t *destination_row = destination_uv +
             ((unsigned)dst_y / 2 + row) * surface->stride +
             (unsigned)dst_x;
@@ -1821,13 +1909,13 @@ static VAStatus put_image(VADriverContextP ctx, VASurfaceID surface_id,
             ((unsigned)src_y / 2 + row) * image->image.pitches[1] +
             (planar ? (unsigned)src_x / 2u : (unsigned)src_x);
         if (!planar) {
-            memmove(destination_row, source_u, src_width);
+            memmove(destination_row, source_u, chroma_bytes);
             continue;
         }
         const uint8_t *source_v = source + image->image.offsets[2] +
             ((unsigned)src_y / 2 + row) * image->image.pitches[2] +
             (unsigned)src_x / 2u;
-        for (unsigned column = 0; column < src_width / 2; ++column) {
+        for (unsigned column = 0; column < chroma_columns; ++column) {
             destination_row[column * 2u] = source_u[column];
             destination_row[column * 2u + 1u] = source_v[column];
         }

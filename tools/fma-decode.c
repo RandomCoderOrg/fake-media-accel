@@ -212,18 +212,43 @@ static uint32_t parse_codec(const char *name) {
     return 0;
 }
 
+static bool visible_nv12_layout(uint32_t width, uint32_t height,
+                                size_t *chroma_row_bytes,
+                                size_t *visible_bytes) {
+    if (!width || !height || width > SIZE_MAX / height)
+        return false;
+    size_t y_bytes = (size_t)width * height;
+    size_t chroma_row = ((size_t)width + 1u) / 2u * 2u;
+    size_t chroma_rows = ((size_t)height + 1u) / 2u;
+    if (chroma_row > SIZE_MAX / chroma_rows)
+        return false;
+    size_t chroma_bytes = chroma_row * chroma_rows;
+    if (chroma_bytes > SIZE_MAX - y_bytes)
+        return false;
+    if (chroma_row_bytes)
+        *chroma_row_bytes = chroma_row;
+    if (visible_bytes)
+        *visible_bytes = y_bytes + chroma_bytes;
+    return true;
+}
+
 static int write_visible_nv12(FILE *output,
                               const struct fma_frame_pool *pool,
                               const struct fma_frame *frame,
                               const uint8_t *slot, size_t *written) {
+    size_t chroma_row_bytes = 0;
+    size_t visible_bytes = 0;
     if (!output || !pool || !frame || !slot || !written ||
         frame->pixel_format != FMA_PIXFMT_NV12 ||
         frame->stride != pool->stride || !frame->width || !frame->height ||
-        (frame->width & 1u) || (frame->height & 1u) ||
-        frame->width > pool->stride || frame->height > pool->height)
+        frame->width > pool->stride || frame->height > pool->height ||
+        !visible_nv12_layout(frame->width, frame->height,
+                             &chroma_row_bytes, &visible_bytes) ||
+        chroma_row_bytes > pool->stride)
         return -1;
     size_t y_allocation = (size_t)pool->stride * pool->height;
-    size_t uv_allocation = y_allocation / 2u;
+    size_t uv_allocation =
+        (size_t)pool->stride * ((pool->height + 1u) / 2u);
     if (y_allocation > pool->slot_size ||
         uv_allocation > pool->slot_size - y_allocation)
         return -1;
@@ -233,12 +258,12 @@ static int write_visible_nv12(FILE *output,
                    frame->width, output) != frame->width)
             return -1;
     }
-    for (uint32_t row = 0; row < frame->height / 2u; ++row) {
+    for (uint32_t row = 0; row < (frame->height + 1u) / 2u; ++row) {
         if (fwrite(uv + (size_t)row * pool->stride, 1,
-                   frame->width, output) != frame->width)
+                   chroma_row_bytes, output) != chroma_row_bytes)
             return -1;
     }
-    *written = (size_t)frame->width * frame->height * 3u / 2u;
+    *written = visible_bytes;
     return 0;
 }
 
@@ -260,10 +285,14 @@ static int process_message(struct fma_client *client,
         } else {
             const uint8_t *slot =
                 pool_map + (size_t)frame.slot * pool->slot_size;
-            size_t recorded_bytes = visible_output ?
-                (size_t)frame.width * frame.height * 3u / 2u :
-                frame.bytes_used;
-            if (output) {
+            size_t recorded_bytes = frame.bytes_used;
+            if (visible_output &&
+                !visible_nv12_layout(frame.width, frame.height, NULL,
+                                     &recorded_bytes)) {
+                errno = EPROTO;
+                result = -1;
+            }
+            if (result == 0 && output) {
                 int write_result = 0;
                 if (visible_output) {
                     write_result = write_visible_nv12(
@@ -277,14 +306,16 @@ static int process_message(struct fma_client *client,
                     result = -1;
                 }
             }
-            if (frame_info &&
+            if (result == 0 && frame_info &&
                 fprintf(frame_info, "%llu,%llu,%zu,%u,%u,%u\n",
                         (unsigned long long)*frames,
                         (unsigned long long)*output_bytes, recorded_bytes,
                         frame.width, frame.height, frame.stride) < 0)
                 result = -1;
-            *output_bytes += recorded_bytes;
-            ++*frames;
+            if (result == 0) {
+                *output_bytes += recorded_bytes;
+                ++*frames;
+            }
             if (fma_client_release_frame(client, frame.slot) < 0)
                 result = -1;
         }

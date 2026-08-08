@@ -215,6 +215,19 @@ int main(void) {
         CHECK(table.vaDestroyBuffer(&context, buffers[i]) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyContext(&context, decoder) == VA_STATUS_SUCCESS);
     CHECK(table.vaDestroySurfaces(&context, surfaces, 2) == VA_STATUS_SUCCESS);
+
+    VASurfaceID resized_surfaces[2];
+    CHECK(table.vaCreateSurfaces(&context, 32, 33, VA_RT_FORMAT_YUV420, 2,
+                                 resized_surfaces) == VA_STATUS_SUCCESS);
+    VAContextID resized_decoder;
+    CHECK(table.vaCreateContext(&context, config, 32, 33, 0,
+                                resized_surfaces, 2, &resized_decoder) ==
+          VA_STATUS_SUCCESS);
+    CHECK(resized_decoder == decoder);
+    CHECK(table.vaDestroyContext(&context, resized_decoder) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroySurfaces(&context, resized_surfaces, 2) ==
+          VA_STATUS_SUCCESS);
     CHECK(table.vaDestroyConfig(&context, config) == VA_STATUS_SUCCESS);
 
     VAConfigID vp9_config;

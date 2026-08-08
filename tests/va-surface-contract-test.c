@@ -223,6 +223,28 @@ int main(void) {
     CHECK(table.vaUnmapBuffer(&context, planar_download.buf) ==
           VA_STATUS_SUCCESS);
 
+    VAImage odd_planar_download;
+    CHECK(table.vaCreateImage(&context, &formats[1], 31, 33,
+                              &odd_planar_download) == VA_STATUS_SUCCESS);
+    CHECK(table.vaGetImage(&context, surface, 0, 0, 31, 33,
+                           odd_planar_download.image_id) == VA_STATUS_SUCCESS);
+    uint8_t *odd_planar_pixels = NULL;
+    CHECK(table.vaMapBuffer(&context, odd_planar_download.buf,
+                            (void **)&odd_planar_pixels) == VA_STATUS_SUCCESS);
+    CHECK(odd_planar_pixels[odd_planar_download.offsets[0] +
+                            32 * odd_planar_download.pitches[0] + 30] ==
+          luma_value(30, 32));
+    CHECK(odd_planar_pixels[odd_planar_download.offsets[1] +
+                            16 * odd_planar_download.pitches[1] + 15] ==
+          chroma_value(30, 16));
+    CHECK(odd_planar_pixels[odd_planar_download.offsets[2] +
+                            16 * odd_planar_download.pitches[2] + 15] ==
+          chroma_value(31, 16));
+    CHECK(table.vaUnmapBuffer(&context, odd_planar_download.buf) ==
+          VA_STATUS_SUCCESS);
+    CHECK(table.vaDestroyImage(&context, odd_planar_download.image_id) ==
+          VA_STATUS_SUCCESS);
+
     VAImage planar_upload;
     CHECK(table.vaCreateImage(&context, &formats[1], 32, 32,
                               &planar_upload) == VA_STATUS_SUCCESS);
