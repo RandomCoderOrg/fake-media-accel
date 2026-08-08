@@ -58,10 +58,11 @@ back to 352x288. MediaCodec keeps a 352x288 allocation and changes its crop
 rectangle. FMA now reports that visible size with each frame rather than
 mistaking the padded allocation for scaled video.
 
-For the three resized frames, luma matched exactly. Chroma differs only at the
-padding boundary created by the odd 173-line visible height; the aggregate
-comparison is 53.32 dB PSNR. This is a layout-boundary difference, not a scaled
-or corrupted decode.
+The initial verifier used `width * height * 3/2`, which is only valid when both
+dimensions are even and omitted the last chroma row at 282x173. FMA now uses
+`width * height + 2 * ceil(width/2) * ceil(height/2)` throughout its visible
+output and VA image paths. All ten resize frames, including all three odd-height
+frames, now match FFmpeg software decode byte for byte.
 
 A forced 16 KiB MediaCodec input limit correctly rejects the 147,804-byte,
 two-packet quantizer sample before submitting an incomplete VP9 frame. Android's

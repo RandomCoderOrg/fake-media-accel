@@ -72,6 +72,10 @@ The expected line is:
 fake-media-acceld listening on /data/data/com.termux/files/usr/tmp/fake-media-accel.sock
 ```
 
+One daemon serves up to eight simultaneous clients. Each connection owns its
+MediaCodec session, so separate players do not serialize behind one decode
+loop.
+
 FMA itself does not require a display. The `vainfo` and graphical application
 checks later in this guide use an X11 VA display, so start Termux:X11 when those
 checks are needed:
@@ -212,6 +216,14 @@ launched with the same environment. For example, after installing VLC:
 ```bash
 apt install -y vlc
 vlc --avcodec-hw=vaapi /path/to/h264-video.mp4
+```
+
+For a stream that changes coded dimensions, compare every frame's visible
+dimensions and plane checksums through the real FFmpeg VA path:
+
+```bash
+tools/fma-ffmpeg-verify-dynamic.sh \
+  /path/to/dynamic-video.mkv EXPECTED_FRAMES ffmpeg
 ```
 
 For a bounded hardware/software VLC comparison that also accounts for the

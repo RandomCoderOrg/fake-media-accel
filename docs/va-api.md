@@ -46,6 +46,11 @@ descriptor.
   dimensions and exporting the correct UV-plane offset.
 - Per-context protocol serialization, so decode and presentation threads cannot
   consume each other's daemon replies.
+- Up to eight daemon clients are served concurrently, each with an independent
+  MediaCodec session. A stalled player therefore cannot block another VA client
+  during its protocol handshake or decode loop.
+- Compatible VA contexts are retired and reused across coded-size changes so
+  Linux context recreation does not discard MediaCodec reference state.
 - Direct-output registration passes an exportable VA surface DMA-BUF to the
   daemon with its compressed packet. MediaCodec output is copied from the
   `AImage` directly into that final surface, bypassing the intermediate shared

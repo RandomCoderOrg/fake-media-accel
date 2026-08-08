@@ -185,6 +185,80 @@ reached the end in the same VA context. FFplay's `fd` counter includes frames
 intentionally skipped by this seek, so it is not treated as a performance-drop
 measurement in this probe.
 
+## Dynamic-resolution and soak checkpoint
+
+FFmpeg destroys and recreates a VA context when H.264 or VP9 changes coded
+dimensions. Android MediaCodec is stateful, so closing its decoder at that VA
+boundary discarded inter-frame references even though the Linux application
+was continuing the same stream. FMA now retires the logical VA context while
+keeping the compatible MediaCodec session alive. A same-codec, same-profile
+context whose requested dimensions fit the decoder allocation reuses that
+session; a key frame at the start of a genuinely new stream flushes it.
+
+The checksum probe compares each software and VA output frame's dimensions and
+three plane checksums. Both application paths are exact:
+
+| Stream | Size transition | Frames | VA contexts | Reused sessions | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| H.264 High | 1280x536 to 640x268 to 1280x536 | 144 | 3 | 2 | exact |
+| VP9 Profile 0 | 352x288 to 282x173 to 352x288 | 10 | 3 | 2 | exact |
+| AV1 Main | 1280x720 to 352x288 | 20 | 1 | 0 | exact |
+
+The VP9 result includes the final chroma row at the odd 173-line height. The
+visible NV12 contract is `width * height + 2 * ceil(width/2) *
+ceil(height/2)`, rather than the even-dimension shortcut `width * height *
+3/2`.
+
+Use the application-level verifier with a full FFmpeg build that includes the
+`showinfo` filter:
+
+```bash
+tools/fma-ffmpeg-verify-dynamic.sh video.mkv EXPECTED_FRAMES ffmpeg
+```
+
+The in-process FFplay loop probe then exercised repeated context changes and
+presentation without repeatedly starting the application:
+
+| Stream | Loops | Expected/stored frames | Contexts/reused | Result |
+| --- | ---: | ---: | ---: | --- |
+| H.264 resize | 3 | 432/432 | 7/6 | passed |
+| VP9 resize | 20 | 200/200 | 41/40 | passed |
+| AV1 size-down | 10 | 200/200 | 1/0 | passed |
+| AV1 switch-frame | 10 | 320/320 | 1/0 | passed |
+
+```mermaid
+xychart-beta
+    title "Dynamic contexts (first bar) and reused sessions (second bar)"
+    x-axis ["H264", "VP9", "AV1 down", "AV1 switch"]
+    y-axis "count" 0 --> 45
+    bar [7, 41, 1, 1]
+    bar [6, 40, 0, 0]
+```
+
+FFplay's drop counter is presentation behavior: the tiny resize vectors are
+looped faster than a normal media timeline. Decoder completeness is checked
+independently by requiring the daemon's `stored` count to equal the decoded
+frame count for every loop.
+
+A separate 10-loop soak used the 15-second Gravity samples without restarting
+FFplay:
+
+| Codec | Expected/stored | Wall time | Application CPU | Peak RSS | Presentation drops |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| H.264 | 3580/3580 | 153.740 s | 63.708 s | 89.9 MiB | 7 |
+| VP9 | 3580/3580 | 150.616 s | 63.864 s | 67.5 MiB | 10 |
+| AV1 | 3600/3600 | 150.479 s | 57.050 s | 62.5 MiB | 22 |
+
+Android remained at thermal status 1 and the battery sensor rose from 38.8 to
+39.2 C. These runs prove decoder and application lifecycle stability; they are
+not hardware-versus-software performance comparisons.
+
+The direct dynamic checksum helper was also changed from reopening and skipping
+through the raw file once per frame to one sequential file-descriptor pass. On
+the 15.3 MiB AV1 resize output, observed verification wall time fell from about
+one minute to 6 seconds. This keeps resize correctness cheap enough to run
+before a desktop application.
+
 ## Remaining application work
 
 - Connect the packet-preserving AV1 adapter to additional applications that
@@ -192,4 +266,8 @@ measurement in this probe.
   contract.
 - Add browser/RDD-sandbox socket and DMA-heap access without weakening unrelated
   browser sandboxes.
-- Validate seek, pause/resume, resolution changes and longer playback soaks.
+- Support a non-key adaptive size increase that exceeds the MediaCodec session's
+  initial output allocation. Key-frame/segment switches and changes within the
+  initial allocation already work.
+- Package and supervise the daemon and guest VA driver from uDroid so desktop
+  applications receive one stable, vendor-neutral media contract.
